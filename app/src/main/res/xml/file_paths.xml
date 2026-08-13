@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- 暴露 filesDir/buildproject/ 下的构建产物 APK 给系统安装器 -->
+    <files-path name="builds" path="buildproject/" />
+</paths>
