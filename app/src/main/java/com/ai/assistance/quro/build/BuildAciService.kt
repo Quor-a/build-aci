@@ -5,6 +5,7 @@ import ai.aidl.aci.core.AidlAciRequest
 import ai.aidl.aci.core.AidlAciResponse
 import ai.aidl.aci.core.BaseAidlAciService
 import ai.aidl.aci.core.Capability
+import android.os.Bundle
 import android.util.Log
 import org.json.JSONArray
 import org.json.JSONObject
@@ -31,6 +32,7 @@ class BuildAciService : BaseAidlAciService() {
 
     override fun onCreate() {
         try {
+            BuildAciConsoleBackend.attachContext(applicationContext)
             super.onCreate()
             BuildEngine.init(applicationContext)
             Log.i(TAG, "onCreate 完成（AIDL + LocalSocket 双通道已就绪）")
@@ -147,6 +149,30 @@ class BuildAciService : BaseAidlAciService() {
                 .addFlag(Capability.FLAG_BACKGROUND)
                 .addFlag(Capability.FLAG_NO_UI)
         )
+
+        // 9. SDUI 控制台（受控端只暴露快照与动作，由控制端纯本地渲染）
+        caps.add(
+            Capability.create(
+                "console_ui",
+                "获取控制台 UI 描述 JSON（组件化，由控制端 AciConsoleScreen 纯本地渲染）。"
+            )
+                .addResult("snapshot", "string", "UI 描述 JSON 字符串（aci-sdui-v1 组件树）")
+                .addResult("title", "string", "控制台标题")
+                .addFlag(Capability.FLAG_BACKGROUND)
+                .addFlag(Capability.FLAG_NO_UI)
+        )
+        caps.add(
+            Capability.create(
+                "console_action",
+                "处理控制台前端（控制端）回传的动作：工具链状态/生成工程/列文件/构建/查状态/看日志。"
+            )
+                .addParam("action", "string", true, "动作 id（tools/init/list/assemble/status/logs）")
+                .addParam("payload", "string", false, "动作参数 JSON 字符串（input 回传含 {value,key}）")
+                .addResult("ok", "boolean", "是否成功")
+                .addResult("action", "string", "实际处理的动作")
+                .addFlag(Capability.FLAG_BACKGROUND)
+                .addFlag(Capability.FLAG_NO_UI)
+        )
     }
 
     override fun onCheckPermission(request: AidlAciRequest?, callerPkg: String?): Boolean {
@@ -164,6 +190,8 @@ class BuildAciService : BaseAidlAciService() {
             "build_status" -> handleStatus(request)
             "build_logs" -> handleLogs(request)
             "build_stop" -> handleStop(request)
+            "console_ui" -> handleConsoleUi()
+            "console_action" -> handleConsoleAction(request)
             else -> AidlAciResponse.error(AidlAciError.CAPABILITY_NOT_FOUND, "unknown: ${request.capability}")
         }
     }
@@ -277,6 +305,32 @@ class BuildAciService : BaseAidlAciService() {
         AidlAciResponse.success()
             .putResult("stopped", ok.toString())
             .putResult("summary", if (ok) "已请求终止 $jobId" else "任务不存在: $jobId")
+    }
+
+    // ── SDUI 控制台（受控端只下发快照 + 处理动作，由控制端现成 AciConsoleScreen 渲染）──
+
+    /** console_ui：返回后端驱动的 UI 描述 JSON（只读状态，不触盘，可在 Binder 线程直接调用）。 */
+    private fun handleConsoleUi(): AidlAciResponse {
+        val snap = BuildAciConsoleBackend.buildUiSnapshot()
+        return AidlAciResponse.success(Bundle())
+            .putResult("snapshot", snap.toString())
+            .putResult("title", snap.optString("title", ""))
+    }
+
+    /** console_action：处理前端回传的动作（后台线程跑，避免阻塞 Binder/LocalSocket 线程）。 */
+    private fun handleConsoleAction(req: AidlAciRequest): AidlAciResponse = runNet {
+        val action = req.params?.getString("action") ?: ""
+        if (action.isEmpty()) {
+            return@runNet AidlAciResponse.error(AidlAciError.BAD_REQUEST, "no action")
+        }
+        val payloadStr = req.params?.getString("payload") ?: ""
+        val payload = if (payloadStr.isNotEmpty()) {
+            try { JSONObject(payloadStr) } catch (_: Throwable) { null }
+        } else null
+        val r = BuildAciConsoleBackend.applyAction(action, payload)
+        AidlAciResponse.success(Bundle())
+            .putResult("ok", r.optBoolean("ok", false))
+            .putResult("action", r.optString("action", action))
     }
 
     // ── 后台执行 + 限时 ────────────────────────────────────────
