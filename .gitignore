@@ -17,6 +17,11 @@ release/
 # Gradle
 .gradle/
 build/
+# 注：本 App 的源码包名恰为 com.ai.assistance.quro.build，Gradle 的 build/ 输出模式会误伤该源码目录，需加白。
+!app/src/main/java/com/ai/assistance/quro/build/
+# 构建所需的签名密钥与预编译清单骨架作为 assets 入库（否则真机无法出包）
+!app/src/main/assets/debug.keystore
+!app/src/main/assets/libs/common/base.apk
 
 # Local configuration (SDK path, etc.)
 local.properties
