@@ -105,7 +105,10 @@ object BuildEngine {
         )
         for (c in cands) {
             val f = File(c)
-            if (f.exists() && (f.canExecute() || c.contains("dalvikvm"))) return c
+            // 必须真实存在且可执行；旧逻辑里的 `|| c.contains("dalvikvm")` 会让失效桩路径
+            // （如不存在的 /system/bin/dalvikvm）被误判为可用，导致 ProcessBuilder 直接抛异常、
+            // 日志只剩一行"启动失败"。这里收紧为必须 canExecute()。
+            if (f.exists() && f.canExecute()) return c
         }
         return null
     }
@@ -154,12 +157,15 @@ object BuildEngine {
         log.append("发现 ${sources.size} 个 Java 源文件：\n")
         sources.forEach { log.append("  · ").append(it).append("\n") }
         val dexFile = File(outDir.parentFile ?: outDir, "classes.dex")
+        // 清理上一轮可能残留的损坏 DEX，避免"前几次失败留下坏中间文件"导致本轮也失败
+        dexFile.delete()
 
         // 1) ecj：Java → class
+        // source/target 降到 8：部分旧版打包的 ecj 在 ART 下不支持 11，会静默失败、输出为空
         val ecjArgs = mutableListOf(
             "-d", outDir.absolutePath,
             "-cp", aj.absolutePath,
-            "-source", "11", "-target", "11"
+            "-source", "8", "-target", "8"
         )
         ecjArgs.addAll(sources)
         val r1 = runTool(rt, "$ecj:$aj", "org.eclipse.jdt.internal.compiler.batch.Main", ecjArgs, outDir, 120000)
@@ -283,12 +289,14 @@ object BuildEngine {
 
         val log = StringBuilder()
         val dexFile = File(project, "classes.dex")
+        // 清理上一轮残留的损坏 DEX
+        dexFile.delete()
 
-        // 1) ecj：Java → class
+        // 1) ecj：Java → class（source/target 降到 8，兼容 ART 下的旧版 ecj）
         val ecjArgs = listOf(
             "-d", outDir.absolutePath,
             "-cp", aj.absolutePath,
-            "-source", "11", "-target", "11",
+            "-source", "8", "-target", "8",
             srcFile.absolutePath
         )
         val r1 = runTool(rt, "$ecj:$aj", "org.eclipse.jdt.internal.compiler.batch.Main", ecjArgs, project, 90000)
