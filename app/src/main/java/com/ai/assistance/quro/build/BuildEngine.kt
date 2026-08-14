@@ -57,8 +57,9 @@ object BuildEngine {
         return out
     }
 
-    /** 真实工具链自检。 */
+    /** 真实工具链自检。首次调用会先把 APK assets 里的工具链解压到 filesDir。 */
     fun detectTools(ctx: Context): List<ToolStatus> {
+        ensureAssets(ctx)
         val libs = File(ctx.filesDir, "buildproject/libs")
         val ecj = File(libs, "ecj.jar")
         val d8 = File(libs, "d8.jar")
@@ -114,7 +115,69 @@ object BuildEngine {
     }
 
     /**
-     * 把一段 Java 源码编译为 classes.dex（真实管线：ecj → class，d8 → dex）。
+     * 编译整个 src 目录下所有 .java 文件为 classes.dex（真实管线：ecj → class，d8 → dex）。
+     * 需要设备提供 JVM 运行时；否则返回 ok=false 并说明原因。
+     */
+    fun compileProject(ctx: Context, srcDir: File, outDir: File): BuildResult {
+        val libs = ensureAssets(ctx)
+        val rt = findRuntime()
+            ?: return BuildResult(false, "设备上没有可用的 JVM 运行时（dalvikvm/app_process），无法在端侧编译 Java。\n" +
+                "可在 PC 侧用相同工具链编译后通过「导出 DEX」导入。", null)
+
+        srcDir.mkdirs()
+        outDir.mkdirs()
+        outDir.listFiles()?.forEach { if (it.isFile) it.delete() }
+
+        val sources = srcDir.walkTopDown()
+            .filter { it.isFile && it.name.endsWith(".java", ignoreCase = true) }
+            .map { it.absolutePath }
+            .toList()
+
+        if (sources.isEmpty()) {
+            return BuildResult(false, "src 目录下没有 .java 源文件。", null)
+        }
+
+        val ecj = File(libs, "ecj.jar")
+        val d8 = File(libs, "d8.jar")
+        val aj = File(libs, "android.jar")
+        if (!ecj.exists() || !d8.exists() || !aj.exists()) {
+            return BuildResult(false, "工具链不完整（ecj/d8/android.jar 缺失），无法编译。", null)
+        }
+
+        val log = StringBuilder()
+        log.append("发现 ${sources.size} 个 Java 源文件：\n")
+        sources.forEach { log.append("  · ").append(it).append("\n") }
+        val dexFile = File(outDir.parentFile ?: outDir, "classes.dex")
+
+        // 1) ecj：Java → class
+        val ecjArgs = mutableListOf(
+            "-d", outDir.absolutePath,
+            "-cp", aj.absolutePath,
+            "-source", "11", "-target", "11"
+        )
+        ecjArgs.addAll(sources)
+        val r1 = runTool(rt, "$ecj:$aj", "org.eclipse.jdt.internal.compiler.batch.Main", ecjArgs, outDir, 120000)
+        log.append("\n== ecj 编译 Java → class ==\n").append(r1.output)
+        if (!r1.ok) return BuildResult(false, log.toString(), null)
+
+        // 2) d8：class → dex
+        val d8Args = listOf(
+            "--output", dexFile.absolutePath,
+            "--lib", aj.absolutePath,
+            outDir.absolutePath
+        )
+        val r2 = runTool(rt, d8.absolutePath, "com.android.tools.r8.D8", d8Args, outDir, 120000)
+        log.append("\n== d8 转换 class → dex ==\n").append(r2.output)
+        if (!r2.ok || !dexFile.exists()) {
+            return BuildResult(false, log.toString() + "\n[DEX 未生成]", null)
+        }
+
+        log.append("\n✔ 编译成功：classes.dex（${dexFile.length()} 字节）位于 ${dexFile.absolutePath}")
+        return BuildResult(true, log.toString(), dexFile.absolutePath)
+    }
+
+    /**
+     * 把一段 Java 源码编译为 classes.dex（兼容旧版单文件调用；内部也走 compileProject）。
      * 需要设备提供 JVM 运行时；否则返回 ok=false 并说明原因。
      */
     fun compileToDex(ctx: Context, source: String, className: String): BuildResult {
