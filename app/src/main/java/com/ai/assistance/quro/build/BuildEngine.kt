@@ -2,9 +2,14 @@ package com.ai.assistance.quro.build
 
 import android.content.Context
 import android.util.Log
+import java.io.BufferedInputStream
 import java.io.BufferedReader
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 import java.util.concurrent.TimeUnit
 
 /**
@@ -31,7 +36,8 @@ object BuildEngine {
     data class BuildResult(
         val ok: Boolean,
         val log: String,
-        val dexPath: String? = null
+        val dexPath: String? = null,
+        val apkPath: String? = null
     )
 
     private data class RunResult(val ok: Boolean, val output: String)
@@ -40,7 +46,7 @@ object BuildEngine {
     fun ensureAssets(ctx: Context): File {
         val out = File(ctx.filesDir, "buildproject/libs")
         out.mkdirs()
-        val names = listOf("ecj.jar", "d8.jar", "apksigner.jar", "android.jar", "debug.keystore")
+        val names = listOf("ecj.jar", "d8.jar", "apksigner.jar", "android.jar", "debug.keystore", "base.apk")
         for (n in names) {
             val target = File(out, n)
             if (!target.exists() || target.length() == 0L) {
@@ -173,7 +179,77 @@ object BuildEngine {
         }
 
         log.append("\n✔ 编译成功：classes.dex（${dexFile.length()} 字节）位于 ${dexFile.absolutePath}")
-        return BuildResult(true, log.toString(), dexFile.absolutePath)
+        return BuildResult(true, log.toString(), dexFile.absolutePath, null)
+    }
+
+    /**
+     * 把已生成的 classes.dex 注入 base.apk 模板并签名，产出可直接安装的 APK。
+     * 不需要 aapt2：base.apk 已含 AndroidManifest.xml + resources.arsc，只需塞入 DEX 后签名。
+     */
+    fun assembleApk(ctx: Context, dexPath: String, outApk: File): BuildResult {
+        val libs = ensureAssets(ctx)
+        val rt = findRuntime()
+            ?: return BuildResult(false, "设备上没有可用的 JVM 运行时，无法运行 apksigner。", dexPath, null)
+        val baseApk = File(libs, "base.apk")
+        val signer = File(libs, "apksigner.jar")
+        val keystore = File(libs, "debug.keystore")
+        if (!baseApk.exists() || !signer.exists() || !keystore.exists()) {
+            return BuildResult(false, "工具链不完整（base.apk / apksigner.jar / debug.keystore 缺失），无法构建 APK。", dexPath, null)
+        }
+        val dexFile = File(dexPath)
+        if (!dexFile.exists()) {
+            return BuildResult(false, "classes.dex 不存在，请先编译工程。", dexPath, null)
+        }
+
+        val log = StringBuilder()
+        log.append("== 注入 classes.dex 到 base.apk ==\n")
+        val unsigned = File(outApk.parentFile ?: outApk.parentFile ?: ctx.filesDir, "app-unsigned.apk")
+        try {
+            unsigned.parentFile?.mkdirs()
+            // 复制 base.apk 并替换/添加 classes.dex
+            ZipInputStream(BufferedInputStream(FileInputStream(baseApk))).use { zis ->
+                ZipOutputStream(FileOutputStream(unsigned)).use { zos ->
+                    val copied = mutableSetOf<String>()
+                    var entry = zis.nextEntry
+                    while (entry != null) {
+                        if (entry.name == "classes.dex") {
+                            entry = zis.nextEntry
+                            continue
+                        }
+                        zos.putNextEntry(ZipEntry(entry.name))
+                        zis.copyTo(zos)
+                        zos.closeEntry()
+                        copied.add(entry.name)
+                        entry = zis.nextEntry
+                    }
+                    zos.putNextEntry(ZipEntry("classes.dex"))
+                    FileInputStream(dexFile).use { it.copyTo(zos) }
+                    zos.closeEntry()
+                }
+            }
+            log.append("已生成未签名 APK：${unsigned.absolutePath}（${unsigned.length()} 字节）\n")
+        } catch (e: Throwable) {
+            return BuildResult(false, log.toString() + "\n注入失败：${e.message}", dexPath, null)
+        }
+
+        log.append("\n== apksigner 签名 ==\n")
+        val signArgs = listOf(
+            "sign",
+            "--ks", keystore.absolutePath,
+            "--ks-pass", "pass:android",
+            "--key-pass", "pass:android",
+            "--ks-key-alias", "androiddebugkey",
+            "--in", unsigned.absolutePath,
+            "--out", outApk.absolutePath
+        )
+        val r = runTool(rt, signer.absolutePath, "com.android.apksigner.ApkSignerTool", signArgs, unsigned.parentFile ?: ctx.filesDir, 120000)
+        log.append(r.output)
+        if (!r.ok || !outApk.exists()) {
+            return BuildResult(false, log.toString() + "\n[APK 签名失败]", dexPath, null)
+        }
+        unsigned.delete()
+        log.append("\n✔ APK 构建成功：${outApk.absolutePath}（${outApk.length()} 字节）")
+        return BuildResult(true, log.toString(), dexPath, outApk.absolutePath)
     }
 
     /**
@@ -232,7 +308,7 @@ object BuildEngine {
         }
 
         log.append("\n✔ 编译成功：classes.dex（${dexFile.length()} 字节）位于 ${dexFile.absolutePath}")
-        return BuildResult(true, log.toString(), dexFile.absolutePath)
+        return BuildResult(true, log.toString(), dexFile.absolutePath, null)
     }
 
     /** 用 dalvikvm / app_process 运行一个 JVM main 类，捕获输出并限时。 */

@@ -22,6 +22,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
@@ -56,6 +57,14 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
         if (uri != null) vm.exportDex(context, uri)
     }
 
+    val exportApkLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/vnd.android.package-archive")
+    ) { uri ->
+        if (uri != null) vm.exportApk(context, uri)
+    }
+
+    var showTools by remember { mutableStateOf(false) }
+
     ModalNavigationDrawer(
         drawerState = drawerState,
         gesturesEnabled = true,
@@ -78,7 +87,7 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
                 TopAppBar(
                     title = { Column {
                         Text("Zorv 构建台", fontSize = 18.sp)
-                        Text("多文件 Java 工程 → classes.dex", fontSize = 12.sp, lineHeight = 14.sp)
+                        Text("Java 工程 → DEX → APK", fontSize = 12.sp, lineHeight = 14.sp)
                     } },
                     navigationIcon = {
                         IconButton(onClick = { scope.launch { drawerState.open() } }) {
@@ -87,16 +96,31 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
                     },
                     actions = {
                         IconButton(
+                            onClick = { showTools = true },
+                            enabled = !vm.isBuilding
+                        ) {
+                            Icon(Icons.Default.Build, contentDescription = "工具链")
+                        }
+                        IconButton(
                             onClick = { vm.buildProject() },
                             enabled = !vm.isBuilding
                         ) {
                             Icon(Icons.Default.PlayArrow, contentDescription = "编译工程")
                         }
                         IconButton(
-                            onClick = { if (vm.dexPath != null) exportLauncher.launch("classes.dex") },
+                            onClick = { vm.buildApk() },
+                            enabled = !vm.isBuilding && vm.dexPath != null
+                        ) {
+                            Icon(Icons.Default.Android, contentDescription = "构建 APK")
+                        }
+                        IconButton(
+                            onClick = {
+                                if (vm.apkPath != null) exportApkLauncher.launch("app-release.apk")
+                                else if (vm.dexPath != null) exportLauncher.launch("classes.dex")
+                            },
                             enabled = vm.dexPath != null
                         ) {
-                            Icon(Icons.Default.Share, contentDescription = "导出 DEX")
+                            Icon(Icons.Default.Share, contentDescription = "导出产物")
                         }
                     }
                 )
@@ -197,6 +221,14 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
             dismissButton = {
                 TextButton(onClick = { fileToDelete = null }) { Text("取消") }
             }
+        )
+    }
+
+    if (showTools) {
+        ToolStatusDialog(
+            tools = vm.toolStatus,
+            onRefresh = { vm.refreshToolStatus() },
+            onDismiss = { showTools = false }
         )
     }
 }
@@ -395,5 +427,58 @@ private fun RenameDialog(
             }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun ToolStatusDialog(
+    tools: List<BuildEngine.ToolStatus>,
+    onRefresh: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("工具链状态") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                if (tools.isEmpty()) {
+                    Text("尚未检测，点击刷新。")
+                } else {
+                    tools.forEach { t ->
+                        Row(
+                            Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = if (t.present) Icons.Default.CheckCircle else Icons.Default.Error,
+                                contentDescription = null,
+                                tint = if (t.present) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(t.name, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                                Text(t.note, fontSize = 11.sp, lineHeight = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                if (t.present) {
+                                    Text(t.path, fontSize = 10.sp, lineHeight = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                }
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "提示：base.apk 是空壳 APK（仅 AndroidManifest + resources.arsc）。构建 APK 时把 classes.dex 注入其中并签名，即可在设备上安装调试。",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onRefresh) { Text("刷新") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        }
     )
 }

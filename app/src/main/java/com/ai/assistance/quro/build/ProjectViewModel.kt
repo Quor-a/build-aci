@@ -12,6 +12,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * 端侧工程视图模型：管理 buildproject/src 下的多文件 Java 工程。
@@ -52,10 +55,60 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     var dexPath by mutableStateOf<String?>(null)
         private set
 
+    /** 上一次构建成功的 APK 路径。 */
+    var apkPath by mutableStateOf<String?>(null)
+        private set
+
+    /** 工具链自检结果。 */
+    var toolStatus by mutableStateOf<List<BuildEngine.ToolStatus>>(emptyList())
+        private set
+
     init {
         ensureDefaultProject()
         loadFiles()
+        refreshToolStatus()
     }
+
+    /** 刷新工具链状态。 */
+    fun refreshToolStatus() {
+        toolStatus = BuildEngine.detectTools(getApplication())
+    }
+
+    /** 构建完整 APK（classes.dex 注入 base.apk 并签名）。 */
+    fun buildApk() {
+        val dex = dexPath ?: run {
+            log += "\n请先编译工程生成 classes.dex，再构建 APK。"
+            return
+        }
+        isBuilding = true
+        log = "构建 APK 中…\n"
+        viewModelScope.launch {
+            val out = File(projectRoot, "app-${timestamp()}.apk")
+            val r = withContext(Dispatchers.IO) {
+                BuildEngine.assembleApk(getApplication(), dex, out)
+            }
+            isBuilding = false
+            apkPath = r.apkPath
+            log = r.log
+        }
+    }
+
+    /** 导出 APK 到系统分享/下载。 */
+    fun exportApk(context: Context, uri: android.net.Uri) {
+        val path = apkPath ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                context.contentResolver.openOutputStream(uri)?.use { os ->
+                    File(path).inputStream().use { it.copyTo(os) }
+                }
+                withContext(Dispatchers.Main) { log += "\n已导出 APK 到：$uri" }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) { log += "\n导出失败：${e.message}" }
+            }
+        }
+    }
+
+    private fun timestamp(): String = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.getDefault()).format(Date())
 
     /** 保证默认工程存在：一个带 package 的 Main.java。 */
     private fun ensureDefaultProject() {
