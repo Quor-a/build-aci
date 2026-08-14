@@ -108,7 +108,7 @@ class BuildAciService : BaseAidlAciService() {
         }
         val b = Bundle()
         b.putString("tools", "[$tools]")
-        b.putString("can_assemble_apk", BuildEngine.canAssembleApk().toString())
+        b.putString("can_assemble_apk", BuildEngine.canAssembleApk(applicationContext).toString())
         return AidlAciResponse.success(b)
     }
 }

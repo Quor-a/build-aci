@@ -88,11 +88,23 @@ object BuildEngine {
             ToolStatus("JVM 运行时 dalvikvm", rt != null, rt ?: "未找到",
                 if (rt != null) "可用：可在端侧运行 ecj/d8" else "设备未提供运行时，端侧编译不可用"),
             ToolStatus("aapt2（资源打包）", aapt2 != null, aapt2 ?: "未打包",
-                if (aapt2 != null) "可用：可生成完整 APK" else "未打包：仅能产出 DEX，无法生成完整 APK（缺 resources.arsc）")
+                if (aapt2 != null) "可用：可生成完整 APK" else "未打包：本引擎用 base.apk 模板注入 DEX 再签名，不依赖 aapt2，APK 组装仍可用")
         )
     }
 
-    fun canAssembleApk(): Boolean = findAapt2() != null
+    /**
+     * 是否能组装完整 APK。本引擎的 assembleApk() 是把 classes.dex 注入预置的 base.apk 模板
+     * （已含 AndroidManifest.xml + resources.arsc）再签名，**不经过 aapt2**，因此组装可用性与
+     * aapt2 无关。真正需要的：设备 JVM 运行时 + base.apk + apksigner.jar + debug.keystore。
+     */
+    fun canAssembleApk(ctx: Context): Boolean {
+        ensureAssets(ctx)
+        val rt = findRuntime() ?: return false
+        val libs = File(ctx.filesDir, "buildproject/libs")
+        return File(libs, "base.apk").exists()
+            && File(libs, "apksigner.jar").exists()
+            && File(libs, "debug.keystore").exists()
+    }
 
     private fun findRuntime(): String? {
         // 优先 dalvikvm（经典端侧 JVM 运行器），其次 app_process
@@ -134,8 +146,9 @@ object BuildEngine {
                 "可在 PC 侧用相同工具链编译后通过「导出 DEX」导入。", null)
 
         srcDir.mkdirs()
+        // 递归清空上一轮产物（含 ecj 按包名生成的子目录），避免残留旧 class 干扰本轮
+        outDir.deleteRecursively()
         outDir.mkdirs()
-        outDir.listFiles()?.forEach { if (it.isFile) it.delete() }
 
         val sources = srcDir.walkTopDown()
             .filter { it.isFile && it.name.endsWith(".java", ignoreCase = true) }
@@ -168,7 +181,9 @@ object BuildEngine {
             "-source", "8", "-target", "8"
         )
         ecjArgs.addAll(sources)
-        val r1 = runTool(rt, "$ecj:$aj", "org.eclipse.jdt.internal.compiler.batch.Main", ecjArgs, outDir, 120000)
+        // 注意：dalvikvm 的 -cp 只传 ecj.jar 本身；android.jar 作为编译期依赖由 ecjArgs 里的
+        // "-cp android.jar" 传入（否则会被塞进 dalvikvm 启动 classpath 导致崩溃，见 runTool 注释）。
+        val r1 = runTool(rt, ecj.absolutePath, "org.eclipse.jdt.internal.compiler.batch.Main", ecjArgs, outDir, 120000)
         log.append("\n== ecj 编译 Java → class ==\n").append(r1.output)
         if (!r1.ok) return BuildResult(false, log.toString(), null)
 
@@ -271,7 +286,8 @@ object BuildEngine {
         val project = File(ctx.filesDir, "buildproject")
         val srcDir = File(project, "src").apply { mkdirs() }
         val outDir = File(project, "out").apply { mkdirs() }
-        outDir.listFiles()?.forEach { if (it.isFile) it.delete() }
+        outDir.deleteRecursively()
+        outDir.mkdirs()
 
         val srcFile = File(srcDir, "$className.java")
         try {
@@ -299,7 +315,8 @@ object BuildEngine {
             "-source", "8", "-target", "8",
             srcFile.absolutePath
         )
-        val r1 = runTool(rt, "$ecj:$aj", "org.eclipse.jdt.internal.compiler.batch.Main", ecjArgs, project, 90000)
+        // 注意：dalvikvm 的 -cp 只传 ecj.jar 本身；android.jar 由 ecjArgs 里的 "-cp android.jar" 传入。
+        val r1 = runTool(rt, ecj.absolutePath, "org.eclipse.jdt.internal.compiler.batch.Main", ecjArgs, project, 90000)
         log.append("== ecj 编译 Java → class ==\n").append(r1.output)
         if (!r1.ok) return BuildResult(false, log.toString(), null)
 
@@ -323,7 +340,13 @@ object BuildEngine {
     private fun runTool(rt: String, classpath: String, mainClass: String, args: List<String>, workDir: File, timeoutMs: Long): RunResult {
         return try {
             val cmd = if (rt.endsWith("dalvikvm")) {
-                listOf(rt, "-cp", classpath, mainClass) + args
+                // 关键修复：dalvikvm 的 -cp 只放「工具自身」的 jar（ecj.jar / d8.jar / apksigner.jar）。
+                // android.jar 这类几十 MB 的依赖绝不能放进 dalvikvm 启动 classpath —— dalvikvm 启动时会把
+                // classpath 上的每个 jar 拿去 dexopt/校验，塞进 android.jar 极易 OOM/崩溃，且崩溃信息只进
+                // logcat、不进 stdout，表现为「进程秒退、log 空白、ok=false」。android.jar 应改由工具自身
+                // 的参数传入（ecj 的 -cp / d8 的 --lib），dalvikvm 只需能加载工具自己的类即可。
+                // -Xmx256m 给足编译期堆内存；-Djava.io.tmpdir 指向可写目录，避免 ecj/d8 临时文件写不出去。
+                listOf(rt, "-Xmx256m", "-Djava.io.tmpdir=${workDir.absolutePath}", "-cp", classpath, mainClass) + args
             } else {
                 // app_process：通过 CLASSPATH 环境变量传入，参数为 [working-dir] [main] [args]
                 listOf(rt, "/system/bin", mainClass) + args
@@ -343,13 +366,21 @@ object BuildEngine {
             }
             drain.start()
             val finished = p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)
-            if (!finished) {
-                p.destroyForcibly()
-                RunResult(false, out.toString() + "\n[超时 ${timeoutMs}ms，已强制终止]")
+            val exit = if (finished) {
+                val code = p.exitValue()
+                drain.join(3000)
+                code
             } else {
-                drain.join(2000)
-                RunResult(p.exitValue() == 0, out.toString())
+                p.destroyForcibly()
+                drain.join(3000)
+                -999
             }
+            val tail = when {
+                !finished -> "\n[超时 ${timeoutMs}ms，已强制终止]"
+                exit != 0 -> "\n[进程退出码=$exit —— 非零通常表示 JVM 工具自身报错或 dalvikvm 崩溃（崩溃信息可能只在 logcat，可查 'logcat -s BuildEngine'）]"
+                else -> ""
+            }
+            RunResult(finished && exit == 0, out.toString() + tail)
         } catch (e: Throwable) {
             RunResult(false, "启动失败：${e.javaClass.simpleName}: ${e.message}")
         }
