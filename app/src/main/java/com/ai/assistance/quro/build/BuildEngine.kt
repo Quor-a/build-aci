@@ -232,8 +232,14 @@ object BuildEngine {
         val offsetArraySize = count * 4
         val newStringsStart = spHsize + offsetArraySize
         val newPoolSize = newStringsStart + pos
-        val pool = ByteArray(newPoolSize)
-        w16(pool, 0, spType); w16(pool, 2, spHsize); w32(pool, 4, newPoolSize.toLong())
+        // Android ResChunk size MUST be a multiple of 4; pad the string pool so the
+        // following chunks (resource map / XML tree) stay 4-byte aligned. Without this,
+        // a custom (different-length) package/label misaligns the whole manifest and the
+        // device's ResXMLTree parser rejects it -> "安装包异常". The default package keeps
+        // the original aligned size, which is why only custom packages triggered the failure.
+        val pad = (4 - (newPoolSize % 4)) % 4
+        val pool = ByteArray(newPoolSize + pad)
+        w16(pool, 0, spType); w16(pool, 2, spHsize); w32(pool, 4, pool.size.toLong())
         w32(pool, 8, count.toLong()); w32(pool, 12, styleCount); w32(pool, 16, flags)
         w32(pool, 20, newStringsStart.toLong()); w32(pool, 24, stylesStart)
         var off = 28
