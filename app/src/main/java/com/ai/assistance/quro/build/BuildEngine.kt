@@ -2,8 +2,11 @@ package com.ai.assistance.quro.build
 
 import android.content.Context
 import android.util.Log
-import dalvik.system.DexClassLoader
+import dalvik.system.InMemoryDexClassLoader
 import java.io.BufferedInputStream
+import java.net.URLClassLoader
+import java.nio.ByteBuffer
+import java.util.zip.ZipFile
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -28,14 +31,18 @@ import java.util.zip.ZipOutputStream
  *  - apksig（对产物签名）
  *  - assembleApk：把 classes.dex 注入 base.apk 模板（已含 AndroidManifest.xml + resources.arsc）再签名，不经过 aapt2
  *
- * 运行模型（v2，本次修复的关键）：
- *  旧版用 `dalvikvm` / `app_process` 拉独立 JVM 子进程跑 ecj/d8/apksigner。Android 14+ 起系统限制
+ * 运行模型（v3，真修 Android 16）：
+ *  v1 用 `dalvikvm` / `app_process` 拉独立 JVM 子进程跑 ecj/d8/apksigner。Android 14+ 起系统限制
  *  独立 `dalvikvm` 子进程，Android 16（SDK 36）上该二进制在 VM 启动期直接 SIGABRT（退出码 134），
  *  与 Java 源码无关——这就是「build_dex / build_project 全 134 退出」的根因。
- *  新版改为**进程内（in-process）**执行：用 DexClassLoader 把三个「已 dex 化」的工具 jar
- *  （ecj_dex.jar / d8_dex.jar / apksigner_dex.jar）加载进 App 自己的 ART 进程，通过反射调用
+ *  v2 改为进程内 DexClassLoader 加载（不 spawn 子进程），解决了 SIGABRT；但 DexClassLoader 从
+ *  filesDir（可写目录）加载 dex，触发 Android 16 新增的「Writable dex file ... is not allowed」
+ *  SecurityException——这正是 build_dex / build_project 在 Android 16 上崩的真因。PC 端用
+ *  URLClassLoader 干跑无此限制，所以 v2 在桌面验证「通过」是**假阴性**，未能暴露真机问题。
+ *  v3（本版）改为：直接从 assets 解包后的 jar 提取 classes.dex 字节，用 InMemoryDexClassLoader
+ *  （API 26+，minSdk 已满足）在内存中加载，零落盘 → 彻底绕过 Writable dex 限制。资源（ecj 的
+ *  .properties/.rsc/META-INF/services）由 URLClassLoader 从同一 jar 的 zip 条目提供。反射调用不变：
  *  ecj 的 `Main.compile(String[])`、d8 的 `D8.run(D8Command)`、apksig 的 `ApkSigner.sign()`。
- *  不再 spawn 任何子进程，从根本上消除 Android 16 的 SIGABRT。
  *
  *  dexed 工具 jar 由 PC 侧用 `d8 --min-api 26` 把原始 ecj.jar/d8.jar/apksigner.jar 转成单个
  *  classes.dex（ecj 额外保留其 .properties/.rsc 资源），随 APK 的 assets 下发，首次运行解包到
@@ -60,10 +67,10 @@ object BuildEngine {
     )
 
     // =============================================================================================
-    // 进程内工具链：用 DexClassLoader 加载端侧 dexed 工具 jar，并以反射缓存关键入口，避免重复查找。
+    // 进程内工具链：用 InMemoryDexClassLoader 内存加载端侧 dexed 工具 jar，并以反射缓存关键入口，避免重复查找。
     // =============================================================================================
     private class InProc(
-        val loader: DexClassLoader,
+        val loader: ClassLoader,
         val ecjCtor: Constructor<*>,
         val ecjCompile: Method,
         val d8Parse: Method,
@@ -161,6 +168,16 @@ object BuildEngine {
 
     @Volatile private var cached: InProc? = null
 
+    /** 从 dexed jar 提取 classes.dex 字节，供 InMemoryDexClassLoader 内存加载（不落盘到可写目录）。 */
+    private fun readDexBytes(jar: File): ByteBuffer {
+        ZipFile(jar).use { zf ->
+            val entry = zf.getEntry("classes.dex")
+                ?: throw IllegalStateException("${jar.name} 不含 classes.dex，无法内存加载。")
+            val bytes = zf.getInputStream(entry).readBytes()
+            return ByteBuffer.wrap(bytes)
+        }
+    }
+
     @Synchronized
     private fun getToolchain(ctx: Context): InProc {
         cached?.let { return it }
@@ -168,15 +185,23 @@ object BuildEngine {
         val ecjDex = File(libs, "ecj_dex.jar")
         val d8Dex = File(libs, "d8_dex.jar")
         val sigDex = File(libs, "apksigner_dex.jar")
-        val ecjOrig = File(libs, "ecj.jar")
         if (!ecjDex.exists() || !d8Dex.exists() || !sigDex.exists()) {
             throw IllegalStateException("dexed 工具 jar 缺失（ecj_dex.jar / d8_dex.jar / apksigner_dex.jar），无法在端侧编译。")
         }
-        val oat = File(ctx.filesDir, "buildproject/oat").apply { mkdirs() }
-        // dexPath：ecj 的 dexed jar 放最前（类优先从这里加载），原 ecj.jar 随后兜底资源；其余两个 dexed jar 提供 d8/apksig。
-        val dexPath = listOf(ecjDex, ecjOrig, d8Dex, sigDex)
-            .joinToString(File.pathSeparator) { it.absolutePath }
-        val loader = DexClassLoader(dexPath, oat.absolutePath, null, ctx.classLoader)
+        // Android 16 (API 36) 安全限制：禁止从「可写目录」（如 filesDir）用 DexClassLoader 加载 dex
+        // （SecurityException: Writable dex file '.../xxx_dex.jar' is not allowed）。旧版把 dexed jar 解包到
+        // filesDir 后用 DexClassLoader 加载，正是 build_dex / build_project 在 Android 16 上崩的根因。
+        // 修复：不再落盘加载，直接从解包后的 jar 提取 classes.dex 字节，用 InMemoryDexClassLoader
+        // （API 26+，minSdk 已满足）在内存中加载，零落盘 → 彻底绕过 Writable dex 限制。
+        // 资源（ecj 的 .properties/.rsc/META-INF/services）由 URLClassLoader 从同一 jar 的 zip 条目提供：
+        // 资源读取是普通文件 IO，不受 dex 可写性检查约束；且 dexed jar 不含 .class 条目，URLClassLoader
+        // 不会误加载 Android 不支持的 .class（类本身全部来自内存中的 classes.dex）。
+        val resLoader = URLClassLoader(
+            listOf(ecjDex, d8Dex, sigDex).map { it.toURI().toURL() }.toTypedArray(),
+            null
+        )
+        val dexBuffers = listOf(ecjDex, d8Dex, sigDex).map { readDexBytes(it) }.toTypedArray()
+        val loader = InMemoryDexClassLoader(dexBuffers, resLoader)
 
         val ecjMain = loader.loadClass("org.eclipse.jdt.internal.compiler.batch.Main")
         val d8 = loader.loadClass("com.android.tools.r8.D8")
@@ -220,7 +245,7 @@ object BuildEngine {
         out.mkdirs()
         val names = listOf(
             "ecj.jar", "d8.jar", "apksigner.jar", "android.jar", "debug.keystore", "base.apk",
-            // 已 dex 化的工具 jar：进程内 DexClassLoader 加载，避免 Android 14+ 禁止独立 dalvikvm。
+            // 已 dex 化的工具 jar：进程内 InMemoryDexClassLoader 内存加载，避免 Android 14+ 禁止独立 dalvikvm 且绕开 Android 16 Writable dex 限制。
             "ecj_dex.jar", "d8_dex.jar", "apksigner_dex.jar"
         )
         for (n in names) {
@@ -277,9 +302,9 @@ object BuildEngine {
             ToolStatus("debug.keystore（签名密钥）", key.exists(), key.absolutePath,
                 if (key.exists()) "已就绪" else "缺失"),
             ToolStatus("ecj_dex.jar（进程内 ecj）", ecjDex.exists(), ecjDex.absolutePath,
-                if (ecjDex.exists()) "已就绪：DexClassLoader 进程内加载" else "缺失：端侧编译不可用"),
+                if (ecjDex.exists()) "已就绪：InMemoryDexClassLoader 内存加载" else "缺失：端侧编译不可用"),
             ToolStatus("d8_dex.jar（进程内 d8）", d8Dex.exists(), d8Dex.absolutePath,
-                if (d8Dex.exists()) "已就绪：DexClassLoader 进程内加载" else "缺失：生成 DEX 不可用"),
+                if (d8Dex.exists()) "已就绪：InMemoryDexClassLoader 内存加载" else "缺失：生成 DEX 不可用"),
             ToolStatus("apksigner_dex.jar（进程内签名）", sigDex.exists(), sigDex.absolutePath,
                 if (sigDex.exists()) "已就绪：apksig API 进程内签名" else "缺失：签名不可用"),
             ToolStatus("端侧运行时（App 进程内 ART）", true, "app-process",
