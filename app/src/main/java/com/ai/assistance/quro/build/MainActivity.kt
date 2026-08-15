@@ -1,6 +1,9 @@
 package com.ai.assistance.quro.build
 
+import android.content.ClipboardManager
+import android.content.ClipData
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -161,7 +164,26 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
                 )
                 Spacer(Modifier.height(8.dp))
                 // 日志
-                Text("编译日志", fontSize = 14.sp, fontWeight = androidx.compose.ui.text.font.FontWeight.Bold)
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "编译日志",
+                        fontSize = 14.sp,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.Bold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(
+                        onClick = {
+                            val cm = context.getSystemService(ClipboardManager::class.java)
+                            cm.setPrimaryClip(ClipData.newPlainText("build_log", vm.log))
+                            Toast.makeText(context, "日志已复制到剪贴板", Toast.LENGTH_SHORT).show()
+                        }
+                    ) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "复制日志")
+                    }
+                }
                 Surface(
                     color = MaterialTheme.colorScheme.surfaceVariant,
                     shape = MaterialTheme.shapes.small,
