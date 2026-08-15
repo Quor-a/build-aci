@@ -32,20 +32,22 @@ import java.util.zip.ZipOutputStream
  *  - apksig（对产物签名）
  *  - assembleApk：把 classes.dex 注入 base.apk 模板（已含 AndroidManifest.xml + resources.arsc）再签名，不经过 aapt2
  *
- * 运行模型（v4，真修 Android 16 的 ClassNotFoundException）：
+ * 运行模型（v5，真修 Android 16 的 ClassNotFoundException）：
  *  v1 用 `dalvikvm` 拉独立 JVM 子进程 → Android 16 上 VM 启动期 SIGABRT（退出码 134）。
  *  v2 改进程内 DexClassLoader 从 filesDir 加载 → Android 16「Writable dex file ... is not allowed」。
- *  v3 改 InMemoryDexClassLoader（堆 ByteBuffer）+ URLClassLoader 父加载器。但真机仍报
+ *  v3/v4 改 InMemoryDexClassLoader（堆/direct ByteBuffer）+ URLClassLoader 父加载器。但真机仍报
  *  `ClassNotFoundException: org.eclipse.jdt.internal.compiler.batch.Main`，而 DexPathList 里
- *  InMemoryDexFile 又「加载成功」——经查：dex 文件本身完好（桌面 APK 内 ecj_dex.jar 的 classes.dex
- *  确实定义了 Main 类），问题在「加载」。两个叠加根因：
- *   (a) 部分 Android 16 ROM 上 InMemoryDexClassLoader 从**堆 ByteBuffer** 静默得到空 dex（class_defs
- *       读不到），必须改用 **direct ByteBuffer**；
- *   (b) 覆盖安装时 ensureAssets 只在文件「不存在」时解包，filesDir 残留旧（坏）_dex.jar 不被替换
- *       → 设备一直用旧 dex。现改为三个 dexed jar **每次强制覆盖解包**并设为**只读**。
- *  v4（本版）据此：direct ByteBuffer 的 InMemoryDexClassLoader 为主路径；若仍抛异常则**自动回退**
- *  DexClassLoader 从只读 dexed jar 加载（Android 14+ 只拦「可写」dex，只读即通过）。两种加载器对
- *  反射调用完全等价。另加「逐类缺失诊断」：加载失败时直接报出是哪一个类未找到，便于真机定位。
+ *  InMemoryDexFile 又「加载成功」——确认 dex 本身完好（dexdump 验证 DEX 038、ecj 含 Main 类），问题在「加载」。
+ *  真正根因（v5 修）：
+ *   (1) InMemoryDexClassLoader 从 ByteBuffer（含 allocateDirect）加载时，若缓冲未页对齐，ART 用 mmap
+ *       静默得到空 dex——DexPathList 里 InMemoryDexFile 看似在、但 class_defs 全读不到。allocateDirect
+ *       不保证页对齐，故堆/direct 缓冲在 ColorOS/Android 16 上均不可靠。已降级为回退方案。
+ *   (2) jar 内 classes.dex 是 DEFLATED（压缩）的，DexClassLoader 从压缩 jar 加载要靠抽取，ColorOS 上
+ *       该抽取链路不可靠（表现为 ClassNotFound 而非 SecurityException，说明只读已绕过拦截、只是 dex 没加载出）。
+ *  v5（本版）据此：运行期把 classes.dex 从 jar 抽成「独立、未压缩、只读」的 .dex 文件，用**文件型**
+ *  DexClassLoader 从这些只读 .dex 文件加载——文件在文件系统上天然页对齐、ART 直接 mmap，绕开对齐坑；
+ *  只读又通过 Android 14+ 的 Writable dex 检查。资源（ecj 的 .properties/.rsc）由 URLClassLoader 父加载器
+ *  从原 jar 读取。InMemoryDexClassLoader 仅在文件型 DexClassLoader 异常时才回退尝试。
  *
  *  dexed 工具 jar 由 PC 侧用 `d8 --min-api 26` 把原始 ecj.jar/d8.jar/apksigner.jar 转成单个
  *  classes.dex（ecj 额外保留其 .properties/.rsc 资源），随 APK 的 assets 下发，首次运行强制解包到
@@ -214,21 +216,24 @@ object BuildEngine {
             null
         )
 
-        // 优先用 InMemoryDexClassLoader（direct ByteBuffer，零落盘，彻底绕开 Android 16「Writable dex」限制）。
-        // 极少数 ROM 上即便 direct 缓冲也加载失败，则回退到 DexClassLoader 从「只读」dexed jar 加载：
-        // Android 14+ 的 Writable dex 检查只拦「可写」dex 文件，把 dexed jar 设为只读（ensureAssets 已做）
-        // 即可通过。两种加载器对反射调用完全等价。
+        // 主路径：文件型 DexClassLoader 从「只读的独立 .dex 文件」加载（ensureAssets 已抽取并设为只读）。
+        // 独立的未压缩 .dex 文件由 ART 直接 mmap，天然页对齐，在 ColorOS / Android 16 上可靠；
+        // 文件只读即通过 Android 14+ 的「Writable dex」检查（实测只读时不再抛 SecurityException）。
+        // 早期用的 InMemoryDexClassLoader（堆/direct ByteBuffer）在部分 ROM 上因缓冲未页对齐而静默得到空 dex
+        // （DexPathList 里 InMemoryDexFile 看似在、类全读不到），故降级为回退方案。
+        // 资源（ecj 的 .properties/.rsc）由 URLClassLoader 父加载器从原 jar 提供。
+        val oat = File(libs, "oat").apply { mkdirs() }
+        val dexPath = listOf(
+            File(libs, "ecj_classes.dex"),
+            File(libs, "d8_classes.dex"),
+            File(libs, "apksigner_classes.dex")
+        ).joinToString(":") { it.absolutePath }
         val loader = try {
-            val dexBuffers = listOf(ecjDex, d8Dex, sigDex).map { readDexBytes(it) }.toTypedArray()
-            val im = InMemoryDexClassLoader(dexBuffers, resLoader)
-            im.loadClass("org.eclipse.jdt.internal.compiler.batch.Main") // 探测：确认 dex 真被加载
-            Log.i(TAG, "工具链加载：InMemoryDexClassLoader 成功")
-            im
-        } catch (e: Throwable) {
-            Log.w(TAG, "InMemoryDexClassLoader 不可用，回退 DexClassLoader：${e.message}")
-            val dexPath = listOf(ecjDex, d8Dex, sigDex).joinToString(":") { it.absolutePath }
-            val oat = File(libs, "oat").apply { mkdirs() }
             DexClassLoader(dexPath, oat.absolutePath, null, resLoader)
+        } catch (e: Throwable) {
+            Log.w(TAG, "DexClassLoader 不可用，回退 InMemoryDexClassLoader：${e.message}")
+            val bufs = listOf(ecjDex, d8Dex, sigDex).map { readDexBytes(it) }.toTypedArray()
+            InMemoryDexClassLoader(bufs, resLoader)
         }
 
         val ecjMain = loadClassOrFail(loader, "org.eclipse.jdt.internal.compiler.batch.Main")
@@ -295,6 +300,35 @@ object BuildEngine {
                 } catch (e: Throwable) {
                     Log.w(TAG, "解包 $n 失败: ${e.message}")
                 }
+            }
+        }
+        // 额外把三个 dexed jar 里的 classes.dex 抽成「独立的、未压缩的、只读」.dex 文件。
+        // 原因：jar 内 classes.dex 是 DEFLATED（压缩）的，DexClassLoader 从压缩 jar 加载要靠抽取，
+        // 在 ColorOS/Android 16 上该抽取链路不可靠（类读不到，报 ClassNotFoundException 而非 SecurityException）。
+        // 独立、未压缩、只读的 .dex 文件由 ART 直接 mmap 加载，天然页对齐、可靠；只读又绕过 Android 14+ 的
+        // 「Writable dex」限制。资源（ecj 的 .properties/.rsc）仍由 URLClassLoader 从原 jar 读取。
+        val dexOut = mapOf(
+            "ecj_dex.jar" to "ecj_classes.dex",
+            "d8_dex.jar" to "d8_classes.dex",
+            "apksigner_dex.jar" to "apksigner_classes.dex"
+        )
+        for ((jarName, dexName) in dexOut) {
+            val jar = File(out, jarName)
+            val dexFile = File(out, dexName)
+            try {
+                if (dexFile.exists()) {
+                    dexFile.setWritable(true)
+                    dexFile.delete()
+                }
+                ZipFile(jar).use { zf ->
+                    val entry = zf.getEntry("classes.dex")
+                        ?: throw IllegalStateException("$jarName 不含 classes.dex")
+                    dexFile.outputStream().use { os -> zf.getInputStream(entry).copyTo(os) }
+                }
+                dexFile.setReadOnly()
+                Log.i(TAG, "提取 $dexName -> ${dexFile.absolutePath}")
+            } catch (e: Throwable) {
+                Log.w(TAG, "提取 $dexName 失败: ${e.message}")
             }
         }
         return out
