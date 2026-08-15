@@ -28,6 +28,10 @@ import zipfile
 ROOT = r"D:/Calw OS-project/BuildAci"
 COMMON = os.path.join(ROOT, "app", "src", "main", "assets", "libs", "common")
 JAVA = r"C:/Program Files/Java/jdk-17.0.11+9/bin/java.exe"
+JAVAC = r"C:/Program Files/Java/jdk-17.0.11+9/bin/javac.exe"
+# ecj 自带、被重定位进 dex 的那份 javax.lang.model.SourceVersion 的替身源码
+# （原版 <clinit> 调 Runtime.version() -> Android NoSuchMethodError；此版不碰 Java9+ API）
+SV_SRC = os.path.join(ROOT, "tools", "SourceVersion.java")
 JMOD = r"C:/Program Files/Java/jdk-17.0.11+9/jmods/java.compiler.jmod"
 ZIPALIGN = r"D:/Android/Sdk/build-tools/34.0.0/zipalign.exe"
 WORK = r"D:/tmp/regen_tool_dex"
@@ -121,6 +125,25 @@ def verify(out_jar, must_contain):
             raise RuntimeError(f"{out_jar} 缺少资源 {mc}")
 
 
+def inject_android_sourceversion(classes_dir):
+    """编译 tools/SourceVersion.java 并覆盖 ecj 自带(已被重定位到 javax/lang/model)的
+    JDK9 坏版本。原版 <clinit> 调 Runtime.version()（Java9+），Android 无该方法 -> NoSuchMethodError。"""
+    dest = os.path.join(classes_dir, "javax", "lang", "model")
+    os.makedirs(dest, exist_ok=True)
+    # 删掉 ecj 自带的坏版本及其可能的内联类
+    for f in os.listdir(dest):
+        if f.startswith("SourceVersion"):
+            os.remove(os.path.join(dest, f))
+    if not os.path.exists(SV_SRC):
+        raise RuntimeError("SourceVersion.java 源文件缺失: " + SV_SRC)
+    # --release 8：产出 Java8 字节码(v52)，且只引用 Java8 已有 API；-encoding UTF-8 避免中文注释在 GBK 系统下报错
+    subprocess.run([JAVAC, "-encoding", "UTF-8", "--release", "8", "-d", classes_dir, SV_SRC], check=True)
+    out = os.path.join(dest, "SourceVersion.class")
+    if not os.path.exists(out):
+        raise RuntimeError("SourceVersion.class 编译失败: " + out)
+    print(f"    注入 Android 兼容 SourceVersion -> {out}")
+
+
 def process_ecj():
     print("=== ecj_dex.jar ===")
     indir = os.path.join(WORK, "ecj_in")
@@ -153,6 +176,8 @@ def process_ecj():
                         os.rename(sp, dp)
             shutil.rmtree(src, ignore_errors=True)
     combined = os.path.join(WORK, "ecj_combined.jar")
+    # 用兼容 Android 的 SourceVersion 覆盖 ecj 自带的 JDK9 坏版本（见文件头注释）
+    inject_android_sourceversion(indir)
     build_combined(indir, combined)
     dex = d8_dex(combined, os.path.join(WORK, "ecj_dex"))
     repackage(os.path.join(COMMON, "ecj.jar"), dex, os.path.join(COMMON, "ecj_dex.jar"))
