@@ -20,6 +20,9 @@ import java.security.cert.X509Certificate
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import java.util.zip.CRC32
+import java.util.zip.Deflater
+import java.nio.ByteOrder
 
 /**
  * 端侧 APK 构建引擎（真实可用的工具链）。
@@ -537,20 +540,7 @@ object BuildEngine {
             // 这里完整保留 base.apk 的所有条目（含宿主 classes.dex），再把用户编译出的 dex 作为
             // classes2.dex 追加进去。Android 的 PathClassLoader 会自动加载 base APK 里的
             // classes.dex / classes2.dex / …，宿主 Activity 因此能反射调用用户代码。
-            ZipInputStream(BufferedInputStream(FileInputStream(baseApk))).use { zis ->
-                ZipOutputStream(FileOutputStream(unsigned)).use { zos ->
-                    var entry = zis.nextEntry
-                    while (entry != null) {
-                        zos.putNextEntry(ZipEntry(entry.name))
-                        zis.copyTo(zos)
-                        zos.closeEntry()
-                        entry = zis.nextEntry
-                    }
-                    zos.putNextEntry(ZipEntry("classes2.dex"))
-                    FileInputStream(dexFile).use { it.copyTo(zos) }
-                    zos.closeEntry()
-                }
-            }
+            repackAligned(baseApk, dexFile, unsigned)
             log.append("已生成未签名 APK：${unsigned.absolutePath}（${unsigned.length()} 字节，含宿主 classes.dex + 用户 classes2.dex）\n")
         } catch (e: Throwable) {
             return BuildResult(false, log.toString() + "\n注入失败：${e.message}", dexPath, null)
@@ -573,6 +563,106 @@ object BuildEngine {
         unsigned.delete()
         log.append("\n✔ APK 构建成功：${outApk.absolutePath}（${outApk.length()} 字节）")
         return BuildResult(true, log.toString(), dexPath, outApk.absolutePath)
+    }
+
+    /**
+     * 把 base.apk 的所有条目原样重打到 unsigned APK，并追加用户编译出的 classes2.dex，
+     * 同时保证所有 STORED（未压缩）条目按 4 字节对齐——这是 apksigner v2/v3 签名的硬性要求。
+     *
+     * 修复 v1.5.16「安装包异常」根因：旧实现用 ZipOutputStream 重写会把 classes.dex /
+     * resources.arsc / classes2.dex 全部 DEFLATED 压缩，且丢失 4 字节对齐，导致 v2/v3 签名
+     * 校验失败、安装器拒装。这里：
+     *  - 原 STORED 条目保持 STORED；原 DEFLATED 条目用 raw deflate（nowrap=true，含 adler32）
+     *    重新压缩，与 zip 规范一致；classes2.dex 设为 STORED。
+     *  - 仅对 STORED 条目在 local header 的 extra 字段填充 0 字节，使其数据起始地址 4 字节对齐。
+     */
+    private data class ZipEntryMeta(
+        val name: String,
+        val method: Int,
+        val data: ByteArray,
+        val crc: Long,
+        val size: Long
+    )
+
+    private fun repackAligned(baseApk: File, userDex: File, outFile: File) {
+        val crc = CRC32()
+        val entries = mutableListOf<ZipEntryMeta>()
+        ZipInputStream(BufferedInputStream(FileInputStream(baseApk))).use { zis ->
+            var ze = zis.nextEntry
+            while (ze != null) {
+                val entry = ze
+                val raw = zis.readBytes()
+                if (entry.method == ZipEntry.STORED) {
+                    crc.reset(); crc.update(raw)
+                    entries.add(ZipEntryMeta(entry.name, ZipEntry.STORED, raw, crc.value, raw.size.toLong()))
+                } else {
+                    val def = Deflater(Deflater.DEFAULT_COMPRESSION, true)
+                    def.setInput(raw); def.finish()
+                    val buf = java.io.ByteArrayOutputStream()
+                    val tmp = ByteArray(8192)
+                    while (!def.finished()) {
+                        val n = def.deflate(tmp)
+                        if (n > 0) buf.write(tmp, 0, n)
+                    }
+                    def.end()
+                    crc.reset(); crc.update(raw)
+                    entries.add(ZipEntryMeta(entry.name, ZipEntry.DEFLATED, buf.toByteArray(), crc.value, raw.size.toLong()))
+                }
+                ze = zis.nextEntry
+            }
+        }
+        val userRaw = userDex.readBytes()
+        crc.reset(); crc.update(userRaw)
+        entries.add(ZipEntryMeta("classes2.dex", ZipEntry.STORED, userRaw, crc.value, userRaw.size.toLong()))
+
+        val little = ByteOrder.LITTLE_ENDIAN
+        val central = mutableListOf<ByteArray>()
+        var offset = 0
+        FileOutputStream(outFile).use { fos ->
+            for (e in entries) {
+                val nb = e.name.toByteArray(Charsets.UTF_8)
+                var extra = byteArrayOf()
+                if (e.method == ZipEntry.STORED) {
+                    val base = offset + 30 + nb.size
+                    val pad = (4 - (base % 4)) % 4
+                    if (pad > 0) extra = ByteArray(pad)
+                }
+                val lh = ByteArray(30 + nb.size + extra.size)
+                ByteBuffer.wrap(lh).order(little).apply {
+                    putInt(0x04034b50); putShort(20); putShort(0); putShort(e.method.toShort())
+                    putShort(0); putShort(0)
+                    putInt(e.crc.toInt()); putInt(e.data.size); putInt(e.size.toInt())
+                    putShort(nb.size.toShort()); putShort(extra.size.toShort())
+                }
+                System.arraycopy(nb, 0, lh, 30, nb.size)
+                System.arraycopy(extra, 0, lh, 30 + nb.size, extra.size)
+                fos.write(lh); fos.write(e.data)
+                if (e.method == ZipEntry.STORED) {
+                    require((offset + lh.size) % 4 == 0) { "STORED 对齐失败: ${e.name}" }
+                }
+                val ch = ByteArray(46 + nb.size + extra.size)
+                ByteBuffer.wrap(ch).order(little).apply {
+                    putInt(0x02014b50); putShort(20); putShort(20); putShort(0)
+                    putShort(e.method.toShort()); putShort(0); putShort(0)
+                    putInt(e.crc.toInt()); putInt(e.data.size); putInt(e.size.toInt())
+                    putShort(nb.size.toShort()); putShort(extra.size.toShort())
+                    putShort(0); putShort(0); putShort(0); putInt(0); putInt(offset)
+                }
+                System.arraycopy(nb, 0, ch, 46, nb.size)
+                System.arraycopy(extra, 0, ch, 46 + nb.size, extra.size)
+                central.add(ch)
+                offset += lh.size + e.data.size
+            }
+            val cs = offset
+            for (ch in central) { fos.write(ch); offset += ch.size }
+            val eocd = ByteArray(22)
+            ByteBuffer.wrap(eocd).order(little).apply {
+                putInt(0x06054b50); putShort(0); putShort(0)
+                putShort(entries.size.toShort()); putShort(entries.size.toShort())
+                putInt(offset - cs); putInt(cs); putShort(0)
+            }
+            fos.write(eocd)
+        }
     }
 
     /**
