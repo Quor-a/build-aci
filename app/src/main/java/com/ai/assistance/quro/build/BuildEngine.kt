@@ -51,6 +51,26 @@ import java.util.zip.ZipOutputStream
  *  classes.dex（ecj 额外保留其 .properties/.rsc 资源），并用 zipalign 使其 classes.dex STORED+对齐，
  *  随 APK 的 assets 下发，首次运行强制解包到 filesDir/buildproject/libs（覆盖安装也强制重解包）。
  */
+/**
+ * 把异常完整堆栈（含 Caused by 链路）转成字符串。
+ * 真机上不能用 adb 取日志，必须让构建日志本身带完整堆栈，才能在 App 内直接看到真因，
+ * 而不是只看到一个没用的 "InvocationTargetException: null"（其 message 恒为 null，真因在 cause 里）。
+ */
+private fun throwableDetail(e: Throwable): String {
+    val sw = StringWriter()
+    val pw = PrintWriter(sw)
+    e.printStackTrace(pw)
+    // InvocationTargetException 等包装异常：printStackTrace 已打印 Caused by 链路，
+    // 这里再额外把根因类名/信息提一句，方便一眼定位。
+    var root: Throwable? = e
+    while (root?.cause != null && root.cause !== root) root = root.cause
+    if (root != null && root !== e) {
+        pw.append("\n[根因] ${root.javaClass.name}: ${root.message}\n")
+    }
+    pw.flush()
+    return sw.toString()
+}
+
 object BuildEngine {
     private const val TAG = "BuildEngine"
     const val ZORV_PKG = "com.ai.assistance.quro"
@@ -201,6 +221,13 @@ object BuildEngine {
     private fun getToolchain(ctx: Context): InProc {
         cached?.let { return it }
         val libs = ensureAssets(ctx)
+        // Android 上 System.getProperty("java.io.tmpdir") 默认指向 /data/local/tmp，普通 App 不可写。
+        // ecj / d8 / apksig 进程内运行若需写临时文件会 IOException / NPE（表现为 ecj compile 抛
+        // InvocationTargetException）。改指 App 自身可写的 cache 目录，覆盖安装/多次构建均安全。
+        try {
+            val ecjTmp = File(ctx.cacheDir, "ecj_tmp").apply { mkdirs() }
+            System.setProperty("java.io.tmpdir", ecjTmp.absolutePath)
+        } catch (_: Throwable) {}
         val ecjDex = File(libs, "ecj_dex.jar")
         val d8Dex = File(libs, "d8_dex.jar")
         val sigDex = File(libs, "apksigner_dex.jar")
@@ -399,21 +426,23 @@ object BuildEngine {
         val toolchain = try {
             getToolchain(ctx)
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("\n== 工具链加载失败 ==\n${e.javaClass.name}: ${e.message}\n").toString(), null)
+            return BuildResult(false, log.append("\n== 工具链加载失败（含完整堆栈）==\n").append(throwableDetail(e)).toString(), null)
         }
 
         // 1) ecj：Java → class（source/target 降到 8：旧版 ecj 在 ART 下不支持 11；-proc:none 关闭注解处理，减少噪音）
         val ecjArgs = mutableListOf(
             "-proc:none",
             "-d", outDir.absolutePath,
-            "-cp", aj.absolutePath,
+            // android.jar 必须作 bootclasspath：Android 编译的"引导类"（java.lang.* / android.*）都来自它。
+            // 只给 -cp 而不给 -bootclasspath 时，ecj 会去取 JVM 默认的 rt.jar（ART 上不存在）→ 内部抛异常。
+            "-bootclasspath", aj.absolutePath,
             "-source", "8", "-target", "8"
         )
         ecjArgs.addAll(sources)
         val (ecjOk, ecjOut) = try {
             toolchain.compileEcj(ecjArgs.toTypedArray())
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("\n== ecj 进程内崩溃 ==\n${e.javaClass.name}: ${e.message}\n").toString(), null)
+            return BuildResult(false, log.append("\n== ecj 进程内崩溃（含完整堆栈）==\n").append(throwableDetail(e)).toString(), null)
         }
         log.append("\n== ecj 编译 Java → class ==\n").append(ecjOut)
         if (!ecjOk) return BuildResult(false, log.toString(), null)
@@ -436,7 +465,7 @@ object BuildEngine {
         try {
             toolchain.runD8(d8Args)
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("\n== d8 进程内崩溃 ==\n${e.javaClass.name}: ${e.message}\n[DEX 未生成]").toString(), null)
+            return BuildResult(false, log.append("\n== d8 进程内崩溃（含完整堆栈）==\n").append(throwableDetail(e)).append("\n[DEX 未生成]").toString(), null)
         }
         if (!dexFile.exists()) {
             return BuildResult(false, log.toString() + "\n[DEX 未生成]", null)
@@ -496,12 +525,12 @@ object BuildEngine {
         val toolchain = try {
             getToolchain(ctx)
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("工具链加载失败：${e.javaClass.name}: ${e.message}\n[APK 签名失败]").toString(), dexPath, null)
+            return BuildResult(false, log.append("工具链加载失败（含完整堆栈）：\n").append(throwableDetail(e)).append("\n[APK 签名失败]").toString(), dexPath, null)
         }
         try {
             toolchain.signApk(unsigned, outApk, keystore, "android", "android", "androiddebugkey")
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("签名失败：${e.javaClass.name}: ${e.message}\n[APK 签名失败]").toString(), dexPath, null)
+            return BuildResult(false, log.append("签名失败（含完整堆栈）：\n").append(throwableDetail(e)).append("\n[APK 签名失败]").toString(), dexPath, null)
         }
         if (!outApk.exists()) {
             return BuildResult(false, log.toString() + "\n[APK 签名失败]", dexPath, null)
@@ -546,21 +575,21 @@ object BuildEngine {
         val toolchain = try {
             getToolchain(ctx)
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("\n== 工具链加载失败 ==\n${e.javaClass.name}: ${e.message}\n").toString(), null)
+            return BuildResult(false, log.append("\n== 工具链加载失败（含完整堆栈）==\n").append(throwableDetail(e)).toString(), null)
         }
 
         // 1) ecj：Java → class（source/target 降到 8，兼容 ART 下的旧版 ecj）
         val ecjArgs = arrayOf(
             "-proc:none",
             "-d", outDir.absolutePath,
-            "-cp", aj.absolutePath,
+            "-bootclasspath", aj.absolutePath,
             "-source", "8", "-target", "8",
             srcFile.absolutePath
         )
         val (ecjOk, ecjOut) = try {
             toolchain.compileEcj(ecjArgs)
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("== ecj 进程内崩溃 ==\n${e.javaClass.name}: ${e.message}\n").toString(), null)
+            return BuildResult(false, log.append("== ecj 进程内崩溃（含完整堆栈）==\n").append(throwableDetail(e)).toString(), null)
         }
         log.append("== ecj 编译 Java → class ==\n").append(ecjOut)
         if (!ecjOk) return BuildResult(false, log.toString(), null)
@@ -583,7 +612,7 @@ object BuildEngine {
         try {
             toolchain.runD8(d8Args)
         } catch (e: Throwable) {
-            return BuildResult(false, log.append("\n== d8 进程内崩溃 ==\n${e.javaClass.name}: ${e.message}\n[DEX 未生成]").toString(), null)
+            return BuildResult(false, log.append("\n== d8 进程内崩溃（含完整堆栈）==\n").append(throwableDetail(e)).append("\n[DEX 未生成]").toString(), null)
         }
         if (!dexFile.exists()) {
             return BuildResult(false, log.toString() + "\n[DEX 未生成]", null)
