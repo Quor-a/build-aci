@@ -71,6 +71,23 @@ private fun throwableDetail(e: Throwable): String {
     return sw.toString()
 }
 
+/**
+ * 把构建日志双写到 App 外部存储文件，方便真机取回（不需要 adb / 不需要复制粘贴）。
+ * 路径：<外部files>/build_logs/build_<时间戳>.txt 与 latest.txt。
+ * 用户的构建台（真机）崩了以后，我没法在这台 PC 复现（没有 ART，ecj 在普通 JVM 上跑得好好的），
+ * 也拿不到 adb 日志；所以让 App 自己把"真因"落盘到文件，用户用手机文件管理器点开就能发我。
+ * 任何异常都吞掉——绝不允许"写日志"这一步本身把构建结果返回搞挂。
+ */
+private fun saveBuildLog(ctx: Context, log: String) {
+    try {
+        val dir = File(ctx.getExternalFilesDir(null), "build_logs").apply { mkdirs() }
+        val ts = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.US)
+            .format(java.util.Date())
+        File(dir, "build_$ts.txt").writeText(log)
+        File(dir, "latest.txt").writeText(log)
+    } catch (_: Throwable) {}
+}
+
 object BuildEngine {
     private const val TAG = "BuildEngine"
     const val ZORV_PKG = "com.ai.assistance.quro"
@@ -111,20 +128,32 @@ object BuildEngine {
         val apkBuild: Method,
         val apkSign: Method
     ) {
-        /** 进程内跑 ecj。返回 (是否编译成功, 捕获到的 ecj 文本输出)。 */
-        fun compileEcj(args: Array<String>): Pair<Boolean, String> {
+        /**
+         * 进程内跑 ecj。返回 (编译是否成功, ecj 自身文本输出, 抛出的异常或 null)。
+         *
+         * 关键改进（v1.5.12）：**即使 compile() 抛异常，也把 ecj 自己写到 PrintWriter 的输出
+         * 一并带出来**。ecj 在真正崩之前往往已经把关键报错打印进这个 Writer（例如
+         * "package android.app does not exist"、内部 NPE 的上下文、找不到某个类型的线索），
+         * 旧版只在异常分支里丢了一句 "InvocationTargetException: null"，把真因全埋了——
+         * 这正是历次"修复"都瞎猜、修不对的根。现在异常 + ecj 输出一起交差，真机日志就能定位到行。
+         */
+        fun compileEcj(args: Array<String>): Triple<Boolean, String, Throwable?> {
             val prev = Thread.currentThread().contextClassLoader
             val sw = StringWriter()
             val pw = PrintWriter(sw)
+            var ex: Throwable? = null
+            var ok = false
             try {
                 Thread.currentThread().contextClassLoader = loader
                 val main = ecjCtor.newInstance(pw, pw, false) // systemExitWhenFinished=false
-                val ok = ecjCompile.invoke(main, args) as Boolean
-                pw.flush()
-                return ok to sw.toString()
+                ok = ecjCompile.invoke(main, args) as Boolean
+            } catch (e: Throwable) {
+                ex = e
             } finally {
+                pw.flush()
                 Thread.currentThread().contextClassLoader = prev
             }
+            return Triple(ok, sw.toString(), ex)
         }
 
         /** 进程内跑 d8：用 D8Command.parse 解析 CLI 风格参数，再 D8.run。失败抛异常（调用方捕获）。 */
@@ -439,13 +468,19 @@ object BuildEngine {
             "-source", "8", "-target", "8"
         )
         ecjArgs.addAll(sources)
-        val (ecjOk, ecjOut) = try {
-            toolchain.compileEcj(ecjArgs.toTypedArray())
-        } catch (e: Throwable) {
-            return BuildResult(false, log.append("\n== ecj 进程内崩溃（含完整堆栈）==\n").append(throwableDetail(e)).toString(), null)
-        }
+        val (ecjOk, ecjOut, ecjEx) = toolchain.compileEcj(ecjArgs.toTypedArray())
         log.append("\n== ecj 编译 Java → class ==\n").append(ecjOut)
-        if (!ecjOk) return BuildResult(false, log.toString(), null)
+        if (ecjEx != null) {
+            val full = log.append("\n== ecj 进程内崩溃（完整堆栈 + ecj 自身输出）==\n")
+                .append(throwableDetail(ecjEx)).toString()
+            saveBuildLog(ctx, full)
+            return BuildResult(false, full, null)
+        }
+        if (!ecjOk) {
+            val f = log.toString()
+            saveBuildLog(ctx, f)
+            return BuildResult(false, f, null)
+        }
 
         // 2) d8：class → dex
         // 关键修复（PC 干跑发现）：本版 R8 的 parse 不支持「目录」作为 program 输入、
@@ -586,13 +621,19 @@ object BuildEngine {
             "-source", "8", "-target", "8",
             srcFile.absolutePath
         )
-        val (ecjOk, ecjOut) = try {
-            toolchain.compileEcj(ecjArgs)
-        } catch (e: Throwable) {
-            return BuildResult(false, log.append("== ecj 进程内崩溃（含完整堆栈）==\n").append(throwableDetail(e)).toString(), null)
-        }
+        val (ecjOk, ecjOut, ecjEx) = toolchain.compileEcj(ecjArgs)
         log.append("== ecj 编译 Java → class ==\n").append(ecjOut)
-        if (!ecjOk) return BuildResult(false, log.toString(), null)
+        if (ecjEx != null) {
+            val full = log.append("\n== ecj 进程内崩溃（完整堆栈 + ecj 自身输出）==\n")
+                .append(throwableDetail(ecjEx)).toString()
+            saveBuildLog(ctx, full)
+            return BuildResult(false, full, null)
+        }
+        if (!ecjOk) {
+            val f = log.toString()
+            saveBuildLog(ctx, f)
+            return BuildResult(false, f, null)
+        }
 
         // 2) d8：class → dex
         // 关键修复（PC 干跑发现）：本版 R8 的 parse 不支持「目录」作为 program 输入、
