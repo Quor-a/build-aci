@@ -15,6 +15,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import org.json.JSONObject
 
 /**
  * 端侧工程视图模型：管理 buildproject/src 下的多文件 Java 工程。
@@ -26,6 +27,26 @@ import java.util.Locale
  * · 调用 BuildEngine 编译整个工程为 classes.dex
  * · 导出 DEX 到系统下载/分享
  */
+/**
+ * 工程级配置（对应「自己写包名 / 应用名 / 图标 / 签名」）。持久化到 buildproject/project_config.json。
+ * signing.useCustom=false 时回退内置 debug.keystore；true 时用工程内 keystorePath 指向的自定义签名。
+ */
+data class SigningConfig(
+    val useCustom: Boolean = false,
+    val keystorePath: String? = null,
+    val alias: String = "buildaci",
+    val storePassword: String = "",
+    val keyPassword: String = ""
+)
+
+data class ProjectConfig(
+    val packageName: String = "com.example.buildapp",
+    val appLabel: String = "BuildApp",
+    val versionName: String = "1.0.0",
+    val iconPath: String? = null,
+    val signing: SigningConfig = SigningConfig()
+)
+
 class ProjectViewModel(application: Application) : AndroidViewModel(application) {
 
     private val projectRoot: File = File(application.filesDir, "buildproject")
@@ -63,8 +84,13 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     var toolStatus by mutableStateOf<List<BuildEngine.ToolStatus>>(emptyList())
         private set
 
+    /** 工程配置（包名/应用名/版本/图标/签名），持久化于 project_config.json。 */
+    var projectConfig by mutableStateOf(ProjectConfig())
+        private set
+
     init {
         ensureDefaultProject()
+        loadConfig()
         loadFiles()
         refreshToolStatus()
     }
@@ -74,7 +100,200 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
         toolStatus = BuildEngine.detectTools(getApplication())
     }
 
-    /** 构建完整 APK（classes.dex 注入 base.apk 并签名）。 */
+    // =============================================================================================
+    // 工程配置 / 导入（包名 / 应用名 / 图标 / 签名 / 源码与资源导入）
+    // =============================================================================================
+
+    private fun saveConfig() {
+        try {
+            val o = JSONObject()
+            o.put("packageName", projectConfig.packageName)
+            o.put("appLabel", projectConfig.appLabel)
+            o.put("versionName", projectConfig.versionName)
+            o.put("iconPath", projectConfig.iconPath)
+            val s = JSONObject()
+            s.put("useCustom", projectConfig.signing.useCustom)
+            s.put("keystorePath", projectConfig.signing.keystorePath)
+            s.put("alias", projectConfig.signing.alias)
+            s.put("storePassword", projectConfig.signing.storePassword)
+            s.put("keyPassword", projectConfig.signing.keyPassword)
+            o.put("signing", s)
+            File(projectRoot, "project_config.json").writeText(o.toString(2))
+        } catch (e: Throwable) {
+            log += "\n保存配置失败：${e.message}"
+        }
+    }
+
+    private fun loadConfig() {
+        try {
+            val f = File(projectRoot, "project_config.json")
+            if (!f.exists()) return
+            val o = JSONObject(f.readText())
+            val s = o.optJSONObject("signing")
+            val kp = if (s == null || s.isNull("keystorePath")) null else s.optString("keystorePath")
+            projectConfig = ProjectConfig(
+                packageName = o.optString("packageName", "com.example.buildapp"),
+                appLabel = o.optString("appLabel", "BuildApp"),
+                versionName = o.optString("versionName", "1.0.0"),
+                iconPath = if (o.isNull("iconPath")) null else o.optString("iconPath"),
+                signing = SigningConfig(
+                    useCustom = s?.optBoolean("useCustom", false) ?: false,
+                    keystorePath = kp,
+                    alias = s?.optString("alias", "buildaci") ?: "buildaci",
+                    storePassword = s?.optString("storePassword", "") ?: "",
+                    keyPassword = s?.optString("keyPassword", "") ?: ""
+                )
+            )
+        } catch (_: Throwable) {
+            // 解析失败则用默认配置
+        }
+    }
+
+    fun setPackageName(v: String) { projectConfig = projectConfig.copy(packageName = v); saveConfig() }
+    fun setAppLabel(v: String) { projectConfig = projectConfig.copy(appLabel = v); saveConfig() }
+    fun setVersionName(v: String) { projectConfig = projectConfig.copy(versionName = v); saveConfig() }
+    fun setUseCustomSigning(v: Boolean) {
+        projectConfig = projectConfig.copy(signing = projectConfig.signing.copy(useCustom = v)); saveConfig()
+    }
+    fun setSigningAlias(v: String) {
+        projectConfig = projectConfig.copy(signing = projectConfig.signing.copy(alias = v)); saveConfig()
+    }
+    fun setStorePassword(v: String) {
+        projectConfig = projectConfig.copy(signing = projectConfig.signing.copy(storePassword = v)); saveConfig()
+    }
+    fun setKeyPassword(v: String) {
+        projectConfig = projectConfig.copy(signing = projectConfig.signing.copy(keyPassword = v)); saveConfig()
+    }
+
+    /** 当前图标字节（供 UI 预览）；无则用内置默认图标。 */
+    fun loadIconBytes(): ByteArray? {
+        val p = projectConfig.iconPath ?: return null
+        val f = File(projectRoot, p)
+        return if (f.exists()) f.readBytes() else null
+    }
+
+    fun importIcon(context: Context, uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                context.contentResolver.openInputStream(uri)?.use { ins ->
+                    val bytes = ins.readBytes()
+                    val dst = File(projectRoot, "icon.png")
+                    dst.writeBytes(bytes)
+                    withContext(Dispatchers.Main) {
+                        projectConfig = projectConfig.copy(iconPath = "icon.png")
+                        saveConfig()
+                        log += "\n已导入图标：${bytes.size} 字节（将用于 APK 桌面图标）"
+                    }
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) { log += "\n导入图标失败：${e.message}" }
+            }
+        }
+    }
+
+    /** 端内生成自定义签名 keystore（PKCS12）。失败（如设备不可达 BC）时提示改用导入。 */
+    fun generateKeystore(alias: String, storePass: String, keyPass: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val f = File(projectRoot, "signing.p12")
+                BuildEngine.generateKeystore(f, alias, storePass, keyPass)
+                withContext(Dispatchers.Main) {
+                    projectConfig = projectConfig.copy(
+                        signing = SigningConfig(
+                            useCustom = true, keystorePath = "signing.p12",
+                            alias = alias, storePassword = storePass, keyPassword = keyPass
+                        )
+                    )
+                    saveConfig()
+                    log += "\n已生成自定义签名 keystore：${f.absolutePath}（别名 $alias）"
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) {
+                    log += "\n生成签名失败：${e.message}（可改用「导入 keystore」）"
+                }
+            }
+        }
+    }
+
+    fun importKeystore(context: Context, uri: android.net.Uri, alias: String, storePass: String, keyPass: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val name = fileNameFromUri(context, uri)
+                val dst = File(projectRoot, name)
+                context.contentResolver.openInputStream(uri)?.use { ins -> dst.writeBytes(ins.readBytes()) }
+                withContext(Dispatchers.Main) {
+                    projectConfig = projectConfig.copy(
+                        signing = SigningConfig(
+                            useCustom = true, keystorePath = name,
+                            alias = alias, storePassword = storePass, keyPassword = keyPass
+                        )
+                    )
+                    saveConfig()
+                    log += "\n已导入 keystore：$name（别名 $alias）"
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) { log += "\n导入 keystore 失败：${e.message}" }
+            }
+        }
+    }
+
+    /**
+     * 导入文件到工程：
+     *  · .java / .kt → 按源码里声明的 package 落位到 src/<pkgpath>/<Class>.java（参与编译）
+     *  · 其它 → 放进工程 assets/，构建时注入 APK 的 assets/（用户代码经 AssetManager 读取）
+     */
+    fun importFile(context: Context, uri: android.net.Uri) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val name = fileNameFromUri(context, uri)
+                val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() } ?: return@launch
+                if (name.endsWith(".java", ignoreCase = true) || name.endsWith(".kt", ignoreCase = true)) {
+                    val text = String(bytes, Charsets.UTF_8)
+                    val pkg = Regex("""package\s+([\w.]+)\s*;""").find(text)?.groupValues?.get(1)
+                    val cls = name.substringBeforeLast('.').ifBlank { "Imported" }
+                    val relDir = pkg?.replace('.', '/') ?: ""
+                    val destDir = File(srcDir, relDir).apply { mkdirs() }
+                    val dest = File(destDir, "$cls.java")
+                    dest.writeText(text)
+                    withContext(Dispatchers.Main) {
+                        loadFiles()
+                        log += "\n已导入源码：${dest.relativeTo(srcDir).path}（按 package 落位，参与编译）"
+                    }
+                } else {
+                    val adir = File(projectRoot, "assets").apply { mkdirs() }
+                    val dest = File(adir, name)
+                    dest.writeBytes(bytes)
+                    withContext(Dispatchers.Main) {
+                        log += "\n已导入资源：${dest.name}（将打包进 APK 的 assets/）"
+                    }
+                }
+            } catch (e: Throwable) {
+                withContext(Dispatchers.Main) { log += "\n导入文件失败：${e.message}" }
+            }
+        }
+    }
+
+    private fun fileNameFromUri(context: Context, uri: android.net.Uri): String {
+        var name = "import_${System.currentTimeMillis()}"
+        try {
+            if (uri.scheme == "content") {
+                context.contentResolver.query(
+                    uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                        if (i >= 0) name = c.getString(i)
+                    }
+                }
+            } else if (uri.scheme == "file") {
+                name = uri.lastPathSegment ?: name
+            }
+        } catch (_: Throwable) {
+        }
+        return name
+    }
+
+    /** 构建完整 APK（按工程配置改写包名/应用名/图标/签名，注入 classes.dex 并签名）。 */
     fun buildApk() {
         val dex = dexPath ?: run {
             log += "\n请先编译工程生成 classes.dex，再构建 APK。"
@@ -83,9 +302,24 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
         isBuilding = true
         log = "构建 APK 中…\n"
         viewModelScope.launch {
+            val cfg = projectConfig
+            val iconBytes = cfg.iconPath?.let { File(projectRoot, it).takeIf { it.exists() }?.readBytes() }
+            val ksFile = if (cfg.signing.useCustom && cfg.signing.keystorePath != null)
+                File(projectRoot, cfg.signing.keystorePath!!) else null
+            val buildConfig = BuildEngine.BuildConfig(
+                packageName = cfg.packageName,
+                appLabel = cfg.appLabel,
+                versionName = cfg.versionName,
+                iconBytes = iconBytes,
+                keystore = if (cfg.signing.useCustom && ksFile?.exists() == true) ksFile else null,
+                keyAlias = if (cfg.signing.useCustom) cfg.signing.alias else "androiddebugkey",
+                storePassword = if (cfg.signing.useCustom) cfg.signing.storePassword else "android",
+                keyPassword = if (cfg.signing.useCustom) cfg.signing.keyPassword else "android",
+                assetsDir = File(projectRoot, "assets").takeIf { it.exists() }
+            )
             val out = File(projectRoot, "app-${timestamp()}.apk")
             val r = withContext(Dispatchers.IO) {
-                BuildEngine.assembleApk(getApplication(), dex, out)
+                BuildEngine.assembleApk(getApplication(), dex, out, buildConfig)
             }
             isBuilding = false
             apkPath = r.apkPath

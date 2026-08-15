@@ -9,6 +9,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -28,8 +29,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.launch
 
@@ -67,6 +71,21 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
     }
 
     var showTools by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+
+    var pendingAlias by rememberSaveable { mutableStateOf("") }
+    var pendingStorePass by rememberSaveable { mutableStateOf("") }
+    var pendingKeyPass by rememberSaveable { mutableStateOf("") }
+
+    val iconPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importIcon(context, uri)
+    }
+    val keystorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importKeystore(context, uri, pendingAlias, pendingStorePass, pendingKeyPass)
+    }
+    val filePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) vm.importFile(context, uri)
+    }
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -98,6 +117,12 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
                         }
                     },
                     actions = {
+                        IconButton(
+                            onClick = { showSettings = true },
+                            enabled = !vm.isBuilding
+                        ) {
+                            Icon(Icons.Default.Settings, contentDescription = "工程设置")
+                        }
                         IconButton(
                             onClick = { showTools = true },
                             enabled = !vm.isBuilding
@@ -252,6 +277,28 @@ fun BuildApp(vm: ProjectViewModel = viewModel()) {
             onRefresh = { vm.refreshToolStatus() },
             onDismiss = { showTools = false }
         )
+    }
+
+    if (showSettings) {
+        Dialog(onDismissRequest = { showSettings = false }) {
+            Surface(
+                Modifier.fillMaxSize().padding(16.dp),
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.surface
+            ) {
+                ProjectSettingsSheet(
+                    vm = vm,
+                    onPickIcon = { iconPicker.launch(arrayOf("image/*")) },
+                    onPickKeystore = { a, s, k ->
+                        pendingAlias = a; pendingStorePass = s; pendingKeyPass = k
+                        keystorePicker.launch(arrayOf("*/*"))
+                    },
+                    onPickFile = { filePicker.launch(arrayOf("*/*")) },
+                    onGenerateKeystore = { a, s, k -> vm.generateKeystore(a, s, k) },
+                    onDismiss = { showSettings = false }
+                )
+            }
+        }
     }
 }
 
@@ -489,7 +536,7 @@ private fun ToolStatusDialog(
                     }
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        "提示：base.apk 是空壳 APK（仅 AndroidManifest + resources.arsc）。构建 APK 时把 classes.dex 注入其中并签名，即可在设备上安装调试。",
+                        "提示：base.apk 已含 AndroidManifest + resources.arsc + 默认图标。构建 APK 时按工程设置改写包名/应用名/图标、注入用户 classes.dex 并签名，即可在设备独立安装（不同包名互不冲突）。",
                         fontSize = 11.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -503,4 +550,146 @@ private fun ToolStatusDialog(
             TextButton(onClick = onDismiss) { Text("关闭") }
         }
     )
+}
+
+@Composable
+private fun SectionTitle(text: String) {
+    Text(
+        text, fontSize = 15.sp, fontWeight = FontWeight.Bold,
+        color = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(vertical = 8.dp)
+    )
+}
+
+@Composable
+private fun LabeledField(
+    label: String,
+    value: String,
+    isPassword: Boolean = false,
+    onValueChange: (String) -> Unit
+) {
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
+        label = { Text(label) },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        visualTransformation = if (isPassword) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None
+    )
+}
+
+@Composable
+private fun ProjectSettingsSheet(
+    vm: ProjectViewModel,
+    onPickIcon: () -> Unit,
+    onPickKeystore: (alias: String, storePass: String, keyPass: String) -> Unit,
+    onPickFile: () -> Unit,
+    onGenerateKeystore: (alias: String, storePass: String, keyPass: String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val cfg = vm.projectConfig
+    val scroll = rememberScrollState()
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(scroll)
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("工程设置", fontSize = 20.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, contentDescription = "关闭") }
+        }
+        Spacer(Modifier.height(8.dp))
+        HorizontalDivider()
+
+        SectionTitle("基础信息")
+        LabeledField("包名（applicationId）", cfg.packageName) { vm.setPackageName(it) }
+        LabeledField("应用名（桌面显示）", cfg.appLabel) { vm.setAppLabel(it) }
+        LabeledField("版本名", cfg.versionName) { vm.setVersionName(it) }
+        Text(
+            "每个工程用不同包名，安装时才不会互相冲突（覆盖安装还需同签名）。",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider()
+
+        SectionTitle("APK 图标")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            val iconBytes = vm.loadIconBytes()
+            if (iconBytes != null) {
+                val bmp = remember(iconBytes) {
+                    android.graphics.BitmapFactory.decodeByteArray(iconBytes, 0, iconBytes.size)?.asImageBitmap()
+                }
+                if (bmp != null) Image(bmp, contentDescription = null, Modifier.size(56.dp))
+                else Icon(Icons.Default.Android, contentDescription = null, Modifier.size(56.dp))
+            } else {
+                Icon(Icons.Default.Android, contentDescription = null, Modifier.size(56.dp))
+            }
+            Spacer(Modifier.width(12.dp))
+            Button(onClick = onPickIcon) {
+                Icon(Icons.Default.Image, contentDescription = null)
+                Spacer(Modifier.width(4.dp))
+                Text("导入图标 PNG")
+            }
+        }
+        Text(
+            "默认使用内置占位图标；导入后该 PNG 会替换 APK 桌面图标。",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider()
+
+        SectionTitle("签名")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("使用自定义签名", Modifier.weight(1f))
+            Switch(checked = cfg.signing.useCustom, onCheckedChange = { vm.setUseCustomSigning(it) })
+        }
+        if (cfg.signing.useCustom) {
+            LabeledField("别名 alias", cfg.signing.alias) { vm.setSigningAlias(it) }
+            LabeledField("keystore 密码", cfg.signing.storePassword, isPassword = true) { vm.setStorePassword(it) }
+            LabeledField("密钥密码", cfg.signing.keyPassword, isPassword = true) { vm.setKeyPassword(it) }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = { onGenerateKeystore(cfg.signing.alias, cfg.signing.storePassword, cfg.signing.keyPassword) }) {
+                    Icon(Icons.Default.VpnKey, contentDescription = null)
+                    Spacer(Modifier.width(4.dp))
+                    Text("生成新签名")
+                }
+                Button(onClick = { onPickKeystore(cfg.signing.alias, cfg.signing.storePassword, cfg.signing.keyPassword) }) {
+                    Icon(Icons.Default.Upload, contentDescription = null)
+                    Spacer(Modifier.width(4.dp))
+                    Text("导入 keystore")
+                }
+            }
+            if (!cfg.signing.keystorePath.isNullOrBlank()) {
+                Text("当前 keystore：${cfg.signing.keystorePath}", fontSize = 11.sp, color = MaterialTheme.colorScheme.primary)
+            } else {
+                Text("尚未选择 keystore（生成或导入后生效）。", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text(
+                "生成依赖设备 BouncyCastle，部分机型可能不可用；若失败请用「导入 keystore」（用 keytool 在电脑生成后导入）。",
+                fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            Text(
+                "当前使用内置 debug.keystore（android/android/androiddebugkey）。",
+                fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        Spacer(Modifier.height(12.dp))
+        HorizontalDivider()
+
+        SectionTitle("导入文件到工程")
+        Button(onClick = onPickFile) {
+            Icon(Icons.Default.FileOpen, contentDescription = null)
+            Spacer(Modifier.width(4.dp))
+            Text("导入文件")
+        }
+        Text(
+            "· .java / .kt → 按源码 package 落位到 src/，参与编译；\n" +
+                "· 其它文件 → 放入 assets/，打包进 APK 的 assets/（代码经 AssetManager 读取）。",
+            fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
 }

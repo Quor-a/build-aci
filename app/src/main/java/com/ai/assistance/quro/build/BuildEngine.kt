@@ -109,6 +109,178 @@ object BuildEngine {
         val apkPath: String? = null
     )
 
+    /**
+     * 一次 APK 构建的全部可定制项（对应「自己写包名 / 应用名 / 图标 / 签名」诉求）。
+     * 全部带默认值：默认行为等价于旧版（包名 com.example.buildapp、默认图标、debug.keystore 签名）。
+     */
+    data class BuildConfig(
+        val packageName: String = "com.example.buildapp",
+        val appLabel: String = "BuildApp",
+        val versionName: String = "1.0.0",
+        /** 自定义图标 PNG 字节；null = 用模板默认图标。 */
+        val iconBytes: ByteArray? = null,
+        /** 自定义 keystore（PKCS12/JKS）；null = 用内置 debug.keystore。 */
+        val keystore: File? = null,
+        val keyAlias: String = "androiddebugkey",
+        val storePassword: String = "android",
+        val keyPassword: String = "android",
+        /** 工程 assets/ 目录：其中的文件会被注入 APK 的 assets/ 下，供用户代码通过 AssetManager 读取。 */
+        val assetsDir: File? = null
+    ) {
+        // ByteArray 默认 equals 是引用比较，这里按内容比较，避免混淆。
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is BuildConfig) return false
+            return packageName == other.packageName && appLabel == other.appLabel &&
+                versionName == other.versionName && keyAlias == other.keyAlias &&
+                storePassword == other.storePassword && keyPassword == other.keyPassword &&
+                keystore == other.keystore && assetsDir == other.assetsDir &&
+                (iconBytes == null && other.iconBytes == null || iconBytes.contentEquals(other.iconBytes))
+        }
+
+        override fun hashCode(): Int {
+            var h = packageName.hashCode()
+            h = 31 * h + appLabel.hashCode()
+            h = 31 * h + versionName.hashCode()
+            h = 31 * h + keyAlias.hashCode()
+            h = 31 * h + storePassword.hashCode()
+            h = 31 * h + keyPassword.hashCode()
+            h = 31 * h + (keystore?.hashCode() ?: 0)
+            h = 31 * h + (assetsDir?.hashCode() ?: 0)
+            h = 31 * h + (iconBytes?.contentHashCode() ?: 0)
+            return h
+        }
+    }
+
+    // 模板 base.apk 二进制 AndroidManifest.xml 字符串池固定索引（由 dump_manifest.py 解析确认）。
+    // utf8=False（UTF-16LE），字符串按索引引用，故改名/改图标只需替换这几个字符串、其余保持。
+    private const val IDX_PACKAGE = 22
+    private const val IDX_LABEL = 14
+    private const val IDX_VERSION_NAME = 12
+
+    private fun u16(b: ByteArray, o: Int): Int =
+        ((b[o].toInt() and 0xFF)) or ((b[o + 1].toInt() and 0xFF) shl 8)
+    private fun u32(b: ByteArray, o: Int): Long =
+        (b[o].toInt() and 0xFF).toLong() or
+            ((b[o + 1].toInt() and 0xFF).toLong() shl 8) or
+            ((b[o + 2].toInt() and 0xFF).toLong() shl 16) or
+            ((b[o + 3].toInt() and 0xFF).toLong() shl 24)
+    private fun w16(b: ByteArray, o: Int, v: Int) {
+        b[o] = (v and 0xFF).toByte(); b[o + 1] = ((v ushr 8) and 0xFF).toByte()
+    }
+    private fun w32(b: ByteArray, o: Int, v: Long) {
+        b[o] = (v and 0xFF).toByte(); b[o + 1] = ((v ushr 8) and 0xFF).toByte()
+        b[o + 2] = ((v ushr 16) and 0xFF).toByte(); b[o + 3] = ((v ushr 24) and 0xFF).toByte()
+    }
+
+    /**
+     * 改写二进制 AndroidManifest.xml 的包名/应用名/版本名（仅替换字符串池里对应索引的字符串，
+     * XML 树按索引引用，故其它结构原样保留）。启动 Activity 在模板里声明为完整类名
+     * com.example.buildapp.MainActivity，不随 package 变化，宿主 dex 始终能被解析。
+     *
+     * 实现已用 PC 原型（prototype_build.py + aapt2 dump xmltree）验证：改写后包名/应用名生效，
+     * activity 名不变，icon 引用 @0x7f010000 保持。
+     */
+    private fun rewriteManifest(data: ByteArray, newPkg: String, newLabel: String, newVersion: String): ByteArray {
+        val docHsize = u16(data, 2)
+        val spOff = docHsize
+        val spType = u16(data, spOff)
+        val spHsize = u16(data, spOff + 2)
+        val spSize = u32(data, spOff + 4)
+        val count = u32(data, spOff + 8).toInt()
+        val styleCount = u32(data, spOff + 12)
+        val flags = u32(data, spOff + 16)
+        val stringsStart = u32(data, spOff + 20)
+        val stylesStart = u32(data, spOff + 24)
+        val utf8 = (flags and 0x100) != 0L
+
+        val offsets = IntArray(count) { u32(data, spOff + spHsize + 4 * it).toInt() }
+        val base = spOff + stringsStart.toInt()
+        val strings = Array(count) { i ->
+            val p = base + offsets[i]
+            if (utf8) {
+                val n = u16(data, p); var q = p + 2
+                var l = data[q].toInt() and 0xFF; q++
+                val ln = if ((l and 0x80) != 0) {
+                    val l2 = data[q].toInt() and 0xFF; q++; ((l and 0x7F) shl 8) or l2
+                } else l
+                String(data, q, ln, Charsets.UTF_8)
+            } else {
+                val n = u16(data, p); val q = p + 2
+                String(data, q, n * 2, Charsets.UTF_16LE)
+            }
+        }
+        strings[IDX_PACKAGE] = newPkg
+        strings[IDX_LABEL] = newLabel
+        strings[IDX_VERSION_NAME] = newVersion
+
+        val newOffsets = IntArray(count)
+        val parts = mutableListOf<ByteArray>()
+        var pos = 0
+        for (i in strings.indices) {
+            val enc = strings[i].toByteArray(Charsets.UTF_16LE)
+            val n = enc.size / 2
+            val b = ByteArray(2 + enc.size + 2)
+            w16(b, 0, n)
+            System.arraycopy(enc, 0, b, 2, enc.size)
+            w16(b, 2 + enc.size, 0)
+            newOffsets[i] = pos
+            parts.add(b)
+            pos += b.size
+        }
+
+        val offsetArraySize = count * 4
+        val newStringsStart = spHsize + offsetArraySize
+        val newPoolSize = newStringsStart + pos
+        val pool = ByteArray(newPoolSize)
+        w16(pool, 0, spType); w16(pool, 2, spHsize); w32(pool, 4, newPoolSize.toLong())
+        w32(pool, 8, count.toLong()); w32(pool, 12, styleCount); w32(pool, 16, flags)
+        w32(pool, 20, newStringsStart.toLong()); w32(pool, 24, stylesStart)
+        var off = 28
+        for (i in newOffsets.indices) { w32(pool, off, newOffsets[i].toLong()); off += 4 }
+        var p = off
+        for (b in parts) { System.arraycopy(b, 0, pool, p, b.size); p += b.size }
+
+        val tree = data.copyOfRange(spOff + spSize.toInt(), data.size)
+        val out = data.copyOfRange(0, spOff) + pool + tree
+        w32(out, 4, out.size.toLong())
+        return out
+    }
+
+    /**
+     * 端内生成自定义签名 keystore（PKCS12）。自签证书需要 BouncyCastle（Android 运行时自带，
+     * 但不在编译 SDK stub 中），故用反射调用，保证可编译；若设备不可达 BC 则抛异常由上层提示改用导入。
+     */
+    fun generateKeystore(file: File, alias: String, storePass: String, keyPass: String) {
+        val bcProv = Class.forName("org.bouncycastle.jce.provider.BouncyCastleProvider")
+        val provider = bcProv.getDeclaredConstructor().newInstance() as java.security.Provider
+        if (java.security.Security.getProvider("BC") == null) {
+            java.security.Security.addProvider(provider)
+        }
+        val kpg = java.security.KeyPairGenerator.getInstance("RSA")
+        kpg.initialize(2048)
+        val kp = kpg.generateKeyPair()
+        val genCls = Class.forName("org.bouncycastle.x509.X509V3CertificateGenerator")
+        val gen = genCls.getDeclaredConstructor().newInstance()
+        val dn = javax.security.auth.x500.X500Principal("CN=$alias, OU=BuildAci, O=BuildAci, C=CN")
+        genCls.getMethod("setSerialNumber", java.math.BigInteger::class.java)
+            .invoke(gen, java.math.BigInteger.valueOf(System.currentTimeMillis()))
+        genCls.getMethod("setSubjectDN", javax.security.auth.x500.X500Principal::class.java).invoke(gen, dn)
+        genCls.getMethod("setIssuerDN", javax.security.auth.x500.X500Principal::class.java).invoke(gen, dn)
+        genCls.getMethod("setNotBefore", java.util.Date::class.java).invoke(gen, java.util.Date())
+        genCls.getMethod("setNotAfter", java.util.Date::class.java)
+            .invoke(gen, java.util.Date(System.currentTimeMillis() + 10000L * 86400000L))
+        genCls.getMethod("setPublicKey", java.security.PublicKey::class.java).invoke(gen, kp.public)
+        genCls.getMethod("setSignatureAlgorithm", String::class.java).invoke(gen, "SHA256WithRSA")
+        val cert = genCls.getMethod("generate", java.security.PrivateKey::class.java, String::class.java)
+            .invoke(gen, kp.private, "BC") as java.security.cert.X509Certificate
+        val ks = java.security.KeyStore.getInstance("PKCS12")
+        ks.load(null, null)
+        ks.setKeyEntry(alias, kp.private, keyPass.toCharArray(), arrayOf(cert))
+        file.parentFile?.mkdirs()
+        ks.store(java.io.FileOutputStream(file), storePass.toCharArray())
+    }
+
     // =============================================================================================
     // 进程内工具链：用 InMemoryDexClassLoader 内存加载端侧 dexed 工具 jar，并以反射缓存关键入口，避免重复查找。
     // =============================================================================================
@@ -325,7 +497,8 @@ object BuildEngine {
         out.mkdirs()
         // 这三个 dexed 工具 jar 会被重新生成/修正（例如本次修复 ecj dex），必须每次覆盖解包，
         // 否则覆盖安装时 filesDir 里的旧文件不会被替换，设备会一直用旧（坏的）dex。
-        val alwaysExtract = setOf("ecj_dex.jar", "d8_dex.jar", "apksigner_dex.jar")
+        // base.apk 也在列：替换成带图标的模板后必须强制重解包，否则设备会继续用旧的空壳 base.apk。
+        val alwaysExtract = setOf("ecj_dex.jar", "d8_dex.jar", "apksigner_dex.jar", "base.apk")
         val names = listOf(
             "ecj.jar", "d8.jar", "apksigner.jar", "android.jar", "debug.keystore", "base.apk",
             // 已 dex 化的工具 jar：进程内加载，避免 Android 14+ 禁止独立 dalvikvm 且绕开 Android 16 Writable dex 限制。
@@ -519,12 +692,13 @@ object BuildEngine {
      * （com.example.buildapp.MainActivity）。这里把用户 dex 作为 classes2.dex 追加进去，
      * Android 多 dex 机制会自动加载宿主与用户两份 dex，宿主 Activity 反射调用用户代码。
      */
-    fun assembleApk(ctx: Context, dexPath: String, outApk: File): BuildResult {
+    fun assembleApk(ctx: Context, dexPath: String, outApk: File, config: BuildConfig = BuildConfig()): BuildResult {
         val libs = ensureAssets(ctx)
         val baseApk = File(libs, "base.apk")
-        val keystore = File(libs, "debug.keystore")
+        // 自定义 keystore 优先；否则回退内置 debug.keystore（android/android/androiddebugkey）。
+        val keystore = config.keystore ?: File(libs, "debug.keystore")
         if (!baseApk.exists() || !keystore.exists()) {
-            return BuildResult(false, "工具链不完整（base.apk / debug.keystore 缺失），无法构建 APK。", dexPath, null)
+            return BuildResult(false, "工具链不完整（base.apk / keystore 缺失），无法构建 APK。", dexPath, null)
         }
         val dexFile = File(dexPath)
         if (!dexFile.exists()) {
@@ -532,15 +706,21 @@ object BuildEngine {
         }
 
         val log = StringBuilder()
+        val customSign = config.keystore != null
         log.append("== 注入用户 classes.dex（classes2.dex）到 base.apk ==\n")
+        log.append("签名：").append(if (customSign) "自定义 keystore（别名 ${config.keyAlias}）" else "内置 debug.keystore").append("\n")
+        if (config.packageName != "com.example.buildapp" || config.appLabel != "BuildApp" || config.versionName != "1.0.0") {
+            log.append("清单改写：package=${config.packageName}  label=${config.appLabel}  versionName=${config.versionName}\n")
+        }
+        if (config.iconBytes != null) log.append("图标：写入自定义图标（${config.iconBytes.size} 字节）\n")
+        if (config.assetsDir?.isDirectory == true) log.append("资源：注入工程 assets/ 目录\n")
+
         val unsigned = File(outApk.parentFile ?: ctx.filesDir, "app-unsigned.apk")
         try {
             unsigned.parentFile?.mkdirs()
             // base.apk 已含宿主 classes.dex（com.example.buildapp.MainActivity）+ AndroidManifest + resources.arsc。
-            // 这里完整保留 base.apk 的所有条目（含宿主 classes.dex），再把用户编译出的 dex 作为
-            // classes2.dex 追加进去。Android 的 PathClassLoader 会自动加载 base APK 里的
-            // classes.dex / classes2.dex / …，宿主 Activity 因此能反射调用用户代码。
-            repackAligned(baseApk, dexFile, unsigned)
+            // repackAligned 保留全部条目（含宿主 classes.dex），按 config 改写清单/图标、追加用户 classes2.dex 与 assets。
+            repackAligned(baseApk, dexFile, unsigned, config)
             log.append("已生成未签名 APK：${unsigned.absolutePath}（${unsigned.length()} 字节，含宿主 classes.dex + 用户 classes2.dex）\n")
         } catch (e: Throwable) {
             return BuildResult(false, log.toString() + "\n注入失败：${e.message}", dexPath, null)
@@ -553,7 +733,7 @@ object BuildEngine {
             return BuildResult(false, log.append("工具链加载失败（含完整堆栈）：\n").append(throwableDetail(e)).append("\n[APK 签名失败]").toString(), dexPath, null)
         }
         try {
-            toolchain.signApk(unsigned, outApk, keystore, "android", "android", "androiddebugkey")
+            toolchain.signApk(unsigned, outApk, keystore, config.storePassword, config.keyPassword, config.keyAlias)
         } catch (e: Throwable) {
             return BuildResult(false, log.append("签名失败（含完整堆栈）：\n").append(throwableDetail(e)).append("\n[APK 签名失败]").toString(), dexPath, null)
         }
@@ -584,7 +764,7 @@ object BuildEngine {
         val size: Long
     )
 
-    private fun repackAligned(baseApk: File, userDex: File, outFile: File) {
+    private fun repackAligned(baseApk: File, userDex: File, outFile: File, config: BuildConfig) {
         val crc = CRC32()
         val entries = mutableListOf<ZipEntryMeta>()
         ZipInputStream(BufferedInputStream(FileInputStream(baseApk))).use { zis ->
@@ -592,12 +772,20 @@ object BuildEngine {
             while (ze != null) {
                 val entry = ze
                 val raw = zis.readBytes()
+                // 按 config 处理三个定制点：清单改写 / 自定义图标 / 其它保持。
+                val outData = when {
+                    entry.name == "AndroidManifest.xml" ->
+                        rewriteManifest(raw, config.packageName, config.appLabel, config.versionName)
+                    config.iconBytes != null && entry.name.startsWith("res/mipmap-") && entry.name.endsWith("/ic_launcher.png") ->
+                        config.iconBytes!!
+                    else -> raw
+                }
                 if (entry.method == ZipEntry.STORED) {
-                    crc.reset(); crc.update(raw)
-                    entries.add(ZipEntryMeta(entry.name, ZipEntry.STORED, raw, crc.value, raw.size.toLong()))
+                    crc.reset(); crc.update(outData)
+                    entries.add(ZipEntryMeta(entry.name, ZipEntry.STORED, outData, crc.value, outData.size.toLong()))
                 } else {
                     val def = Deflater(Deflater.DEFAULT_COMPRESSION, true)
-                    def.setInput(raw); def.finish()
+                    def.setInput(outData); def.finish()
                     val buf = java.io.ByteArrayOutputStream()
                     val tmp = ByteArray(8192)
                     while (!def.finished()) {
@@ -605,8 +793,8 @@ object BuildEngine {
                         if (n > 0) buf.write(tmp, 0, n)
                     }
                     def.end()
-                    crc.reset(); crc.update(raw)
-                    entries.add(ZipEntryMeta(entry.name, ZipEntry.DEFLATED, buf.toByteArray(), crc.value, raw.size.toLong()))
+                    crc.reset(); crc.update(outData)
+                    entries.add(ZipEntryMeta(entry.name, ZipEntry.DEFLATED, buf.toByteArray(), crc.value, outData.size.toLong()))
                 }
                 ze = zis.nextEntry
             }
@@ -614,6 +802,14 @@ object BuildEngine {
         val userRaw = userDex.readBytes()
         crc.reset(); crc.update(userRaw)
         entries.add(ZipEntryMeta("classes2.dex", ZipEntry.STORED, userRaw, crc.value, userRaw.size.toLong()))
+
+        // 工程 assets/ 下的文件注入 APK（导入的非 .java 资源，用户代码经 AssetManager 读取）。
+        config.assetsDir?.takeIf { it.isDirectory }?.walkTopDown()?.filter { it.isFile }?.forEach { f ->
+            val rel = f.relativeTo(config.assetsDir!!).path.replace('\\', '/')
+            val bytes = f.readBytes()
+            crc.reset(); crc.update(bytes)
+            entries.add(ZipEntryMeta("assets/$rel", ZipEntry.STORED, bytes, crc.value, bytes.size.toLong()))
+        }
 
         val little = ByteOrder.LITTLE_ENDIAN
         val central = mutableListOf<ByteArray>()
