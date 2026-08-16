@@ -347,6 +347,19 @@ class ProjectViewModel(application: Application) : AndroidViewModel(application)
     /** 保证默认工程存在：一个带 package 的 Main.java。 */
     private fun ensureDefaultProject() {
         srcDir.mkdirs()
+        // 旧版 BuildAci 内置的 com/example/buildapp 多文件示例存在编译错误
+        // （如 CalculatorActivity.java:81 的 grid.setAlignment(GridLayout.CENTER) ——
+        // setAlignment 是 GridLayout.LayoutParams 的方法，不属于 GridLayout），
+        // 会导致「打开即构建」失败。该示例非用户所写（升级安装残留在 files/buildproject），
+        // 检测到且尚未重置过时，清空并写入一个干净、可直接编译运行的默认工程。
+        val staleDemo = File(srcDir, "com/example/buildapp")
+        val resetSentinel = File(srcDir, ".demo_reset_v1520")
+        if (staleDemo.exists() && !resetSentinel.exists()) {
+            srcDir.listFiles()?.forEach { f ->
+                if (f.isDirectory) f.deleteRecursively() else f.delete()
+            }
+        }
+        // 默认工程：com/example/hello/Main.java（宿主 MainActivity 经反射调用其 run() 显示结果）
         val pkgDir = File(srcDir, "com/example/hello")
         pkgDir.mkdirs()
         val main = File(pkgDir, "Main.java")
@@ -367,6 +380,8 @@ public class Main {
 """.trimIndent()
             )
         }
+        // 重置哨兵：确保只在首次打开时清理一次旧示例，不误删用户后续工程文件
+        runCatching { resetSentinel.createNewFile() }
     }
 
     /** 重新扫描 src 目录，生成展平的文件树列表（目录也作为节点插入）。 */

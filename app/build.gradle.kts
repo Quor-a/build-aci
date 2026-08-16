@@ -14,8 +14,8 @@ android {
         applicationId = "com.ai.assistance.quro.build"
         minSdk = 26
         targetSdk = 36
-        versionCode = 24
-        versionName = "1.5.19"
+        versionCode = 26
+        versionName = "1.5.21"
     }
 
     buildTypes {
